@@ -57,6 +57,36 @@ function parseViewBox(svgEl: SVGSVGElement): ViewBox | null {
   return { x, y, width, height };
 }
 
+// Bake sizing attrs into the SVG markup so they survive repeated
+// dangerouslySetInnerHTML re-injection — imperative setAttribute gets wiped.
+export function normalizeMermaidSvgMarkup(markup: string): string {
+  return markup.replace(/<svg\b([^>]*)>/i, (_match, attrs: string) => {
+    let next = attrs;
+
+    if (/\bstyle\s*=\s*"/i.test(next)) {
+      next = next.replace(/\bstyle\s*=\s*"([^"]*)"/i, (_m, styleVal: string) => {
+        const rules = styleVal
+          .split(';')
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0 && !/^max-width\s*:/i.test(s));
+        rules.push('max-width: none');
+        return `style="${rules.join('; ')}"`;
+      });
+    } else {
+      next += ' style="max-width: none"';
+    }
+
+    if (!/\bpreserveAspectRatio\s*=/i.test(next)) {
+      next += ' preserveAspectRatio="xMidYMid meet"';
+    }
+    if (!/\bheight\s*=/i.test(next)) {
+      next += ' height="100%"';
+    }
+
+    return `<svg${next}>`;
+  });
+}
+
 // Parse base viewBox from Mermaid SVG markup before DOM mount
 function parseViewBoxFromMarkup(markup: string): ViewBox | null {
   const viewBoxMatch = markup.match(/viewBox\s*=\s*"([^"]+)"/i);
@@ -191,8 +221,9 @@ export const MermaidBlock: React.FC<{ block: Block }> = ({ block }) => {
         const id = `mermaid-${block.id}`;
         const { svg: renderedSvg } = await mermaid.render(id, block.content);
         if (!cancelled) {
-          naturalBoundsRef.current = parseViewBoxFromMarkup(renderedSvg);
-          setSvg(renderedSvg);
+          const normalizedSvg = normalizeMermaidSvgMarkup(renderedSvg);
+          naturalBoundsRef.current = parseViewBoxFromMarkup(normalizedSvg);
+          setSvg(normalizedSvg);
           setError(null);
         }
       } catch (err) {
