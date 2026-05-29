@@ -559,6 +559,7 @@ const MermaidBlockImpl: React.FC<{ block: Block }> = ({ block }) => {
   const diagramBody = (
     <div
       ref={containerRef}
+      data-pinpoint-ignore=""
       className={`rounded-xl bg-muted/30 border border-border/30 overflow-hidden select-none cursor-grab ${isExpanded ? 'h-full min-h-0' : 'h-[min(65vh,36rem)] min-h-[20rem]'}`}
       dangerouslySetInnerHTML={{ __html: svg }}
       onMouseDown={handleMouseDown}
