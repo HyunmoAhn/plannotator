@@ -2,6 +2,7 @@ import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import mermaid from 'mermaid';
 import type { Block } from '../types';
+import { normalizeMermaidSvgMarkup } from './mermaidSvg';
 
 mermaid.initialize({
   startOnLoad: false,
@@ -55,36 +56,6 @@ function parseViewBox(svgEl: SVGSVGElement): ViewBox | null {
   const [x, y, width, height] = values;
   if (width <= 0 || height <= 0) return null;
   return { x, y, width, height };
-}
-
-// Bake sizing attrs into the SVG markup so they survive repeated
-// dangerouslySetInnerHTML re-injection — imperative setAttribute gets wiped.
-export function normalizeMermaidSvgMarkup(markup: string): string {
-  return markup.replace(/<svg\b([^>]*)>/i, (_match, attrs: string) => {
-    let next = attrs;
-
-    if (/\bstyle\s*=\s*"/i.test(next)) {
-      next = next.replace(/\bstyle\s*=\s*"([^"]*)"/i, (_m, styleVal: string) => {
-        const rules = styleVal
-          .split(';')
-          .map((s) => s.trim())
-          .filter((s) => s.length > 0 && !/^max-width\s*:/i.test(s));
-        rules.push('max-width: none');
-        return `style="${rules.join('; ')}"`;
-      });
-    } else {
-      next += ' style="max-width: none"';
-    }
-
-    if (!/\bpreserveAspectRatio\s*=/i.test(next)) {
-      next += ' preserveAspectRatio="xMidYMid meet"';
-    }
-    if (!/\bheight\s*=/i.test(next)) {
-      next += ' height="100%"';
-    }
-
-    return `<svg${next}>`;
-  });
 }
 
 // Parse base viewBox from Mermaid SVG markup before DOM mount

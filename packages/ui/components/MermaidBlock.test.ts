@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { normalizeMermaidSvgMarkup } from './MermaidBlock';
+import { normalizeMermaidSvgMarkup } from './mermaidSvg';
 
 describe('normalizeMermaidSvgMarkup', () => {
   test('replaces natural max-width with max-width:none', () => {
