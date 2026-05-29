@@ -157,7 +157,7 @@ function fitBoundsToContainer(bounds: ViewBox, containerRect: DOMRect): ViewBox 
 /**
  * Renders a mermaid diagram block with zoom controls.
  */
-export const MermaidBlock: React.FC<{ block: Block }> = ({ block }) => {
+const MermaidBlockImpl: React.FC<{ block: Block }> = ({ block }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const expandedOverlayRef = useRef<HTMLDivElement>(null);
   const [svg, setSvg] = useState('');
@@ -598,3 +598,10 @@ export const MermaidBlock: React.FC<{ block: Block }> = ({ block }) => {
     </>
   );
 };
+
+export const MermaidBlock = React.memo(
+  MermaidBlockImpl,
+  (prev, next) =>
+    prev.block.id === next.block.id &&
+    prev.block.content === next.block.content,
+);
