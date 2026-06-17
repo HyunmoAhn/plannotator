@@ -111,7 +111,6 @@ import { AppHeader } from './components/AppHeader';
 import {
   buildDirectEditsSection,
   buildSavedFileChangesSection,
-  buildSourceFileDirectEditsSection,
   composeFeedbackWithEditSections,
   normalizeEditedMarkdown,
 } from './directEdits';
@@ -230,6 +229,8 @@ const feedbackLossDescription = (annotationCount: number, hasDirectEdits: boolea
   return parts.length > 0 ? parts.join(' and ') : 'feedback';
 };
 
+type SourceFileEditWarningAction = 'send-feedback' | 'approve' | 'close';
+
 const App: React.FC = () => {
   const [markdown, setMarkdown] = useState(DEMO_PLAN_CONTENT);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -246,6 +247,9 @@ const App: React.FC = () => {
   const [showFeedbackPrompt, setShowFeedbackPrompt] = useState(false);
   const [showClaudeCodeWarning, setShowClaudeCodeWarning] = useState(false);
   const [showExitWarning, setShowExitWarning] = useState(false);
+  const [showSourceFileEditWarning, setShowSourceFileEditWarning] = useState(false);
+  const [sourceFileEditWarningAction, setSourceFileEditWarningAction] = useState<SourceFileEditWarningAction>('send-feedback');
+  const sourceFileEditWarningContinuationRef = useRef<(() => void | Promise<void>) | null>(null);
   // When the warning dialog confirms, route to the handler matching the button that opened it.
   const [exitWarningAction, setExitWarningAction] = useState<'close' | 'approve'>('close');
   const [showAgentWarning, setShowAgentWarning] = useState(false);
@@ -1543,11 +1547,15 @@ const App: React.FC = () => {
     setConfirmCancelEdits(false);
   }, [activeEditableDocument?.key]);
 
-  // True when there is anything the Direct Edits diff would carry.
-  const hasSourceBackedDirectEdits = unsavedEditableDocuments.length > 0;
-  const hasDirectEdits = hasSourceBackedDirectEdits
-    ? true
-    : isEditingMarkdown ? editorDiffersFromBaseline : editedMarkdownRef.current !== null;
+  const hasUnsavedSourceFileBuffers = unsavedEditableDocuments.length > 0;
+
+  // True when the feedback payload carries unsaved direct edits. Source-backed
+  // file buffers are ordinary dirty editor state; they only become review
+  // context once saved to disk and tracked through savedFileChanges.
+  const hasDirectEdits =
+    !activeSourceSave &&
+    !hasUnsavedSourceFileBuffers &&
+    (isEditingMarkdown ? editorDiffersFromBaseline : editedMarkdownRef.current !== null);
   const hasSavedFileChanges = savedFileChanges.length > 0;
   const hasFeedbackToSend = hasAnyAnnotations || hasDirectEdits || hasSavedFileChanges;
   const feedbackLoss = feedbackLossDescription(feedbackAnnotationCount, hasDirectEdits);
@@ -1563,22 +1571,24 @@ const App: React.FC = () => {
     : null;
 
   // Pinned "Direct edits" card data for the annotation sidebar. Source-backed
-  // folder edits render one card per dirty file so discard is file-scoped.
+  // documents show saved-to-disk changes only; dirty buffers stay in the editor
+  // and file tree until the user explicitly saves.
   const directEditsPanelInfo = useMemo(() => {
-    if (unsavedEditableDocuments.length > 0) {
-      return unsavedEditableDocuments.map((record) => {
-        const stats = computeEditStats(record.diskBaseline, record.currentText);
+    if (savedFileChanges.length > 0) {
+      return savedFileChanges.map((change) => {
+        const stats = computeEditStats(change.beforeText, change.afterText);
         return {
-          id: record.key,
-          sourceKey: record.key,
-          label: record.path ?? record.basename,
+          id: `saved:${change.key}`,
+          title: 'Saved edits',
+          label: change.path,
           added: stats.added,
           removed: stats.removed,
+          description: 'Saved to disk; sent with feedback as context.',
           diffText: createTwoFilesPatch(
-            `${record.path ?? record.basename} (saved)`,
-            `${record.path ?? record.basename} (edited)`,
-            record.diskBaseline,
-            record.currentText,
+            `${change.basename} (opened)`,
+            `${change.basename} (saved)`,
+            change.beforeText,
+            change.afterText,
             undefined,
             undefined,
             { context: 3 },
@@ -1587,28 +1597,8 @@ const App: React.FC = () => {
       });
     }
 
+    if (activeEditableDocument?.sourceSave?.enabled) return null;
     if (!editStats) return null;
-    if (activeEditableDocument?.sourceSave?.enabled) {
-      const edited = activeEditableDocument.currentText;
-      const base = activeEditableDocument.diskBaseline;
-      if (edited === base) return null;
-      return [{
-        id: activeEditableDocument.key,
-        sourceKey: activeEditableDocument.key,
-        label: activeEditableDocument.path ?? activeEditableDocument.basename,
-        added: editStats.added,
-        removed: editStats.removed,
-        diffText: createTwoFilesPatch(
-          `${activeEditableDocument.basename} (saved)`,
-          `${activeEditableDocument.basename} (edited)`,
-          base,
-          edited,
-          undefined,
-          undefined,
-          { context: 3 },
-        ),
-      }];
-    }
     const base = originalMarkdownRef.current;
     const edited = editedMarkdownRef.current;
     if (base === null || edited === null) return null;
@@ -1618,26 +1608,15 @@ const App: React.FC = () => {
       removed: editStats.removed,
       diffText: createTwoFilesPatch('plan.md (original)', 'plan.md (edited)', base, edited, undefined, undefined, { context: 3 }),
     }];
-  }, [activeEditableDocument, editStats, unsavedEditableDocuments]);
+  }, [activeEditableDocument, editStats, savedFileChanges]);
 
   // "Direct Edits" feedback section: unified diff of user edits vs the
   // as-submitted baseline. getEditedMarkdown owns the read discipline.
   const buildEditsSection = useCallback((): string => {
-    const sourceBackedEdits = editableDocuments.getUnsavedDocuments();
-    if (sourceBackedEdits.length > 0) {
-      return buildSourceFileDirectEditsSection(
-        sourceBackedEdits.map((record) => ({
-          path: record.path ?? record.basename,
-          basename: record.basename,
-          base: record.diskBaseline,
-          current: record.currentText,
-        })),
-      );
-    }
-
+    if (activeSourceSave || hasUnsavedSourceFileBuffers) return '';
     const base = originalMarkdownRef.current;
     return buildDirectEditsSection(base, getEditedMarkdown(), sourceConverted);
-  }, [editableDocuments, getEditedMarkdown, sourceConverted]);
+  }, [activeSourceSave, getEditedMarkdown, hasUnsavedSourceFileBuffers, sourceConverted]);
 
   const buildSavedChangesSection = useCallback((): string => {
     return buildSavedFileChangesSection(
@@ -2169,6 +2148,36 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const confirmUnsavedSourceFileEdits = useCallback((
+    action: SourceFileEditWarningAction,
+    continueAction: () => void | Promise<void>,
+  ) => {
+    sourceFileEditWarningContinuationRef.current = continueAction;
+    setSourceFileEditWarningAction(action);
+    setShowSourceFileEditWarning(true);
+  }, []);
+
+  const maybeConfirmUnsavedSourceFileEdits = useCallback((
+    action: SourceFileEditWarningAction,
+    continueAction: () => void | Promise<void>,
+  ): boolean => {
+    if (!hasUnsavedSourceFileBuffers) return false;
+    confirmUnsavedSourceFileEdits(action, continueAction);
+    return true;
+  }, [confirmUnsavedSourceFileEdits, hasUnsavedSourceFileBuffers]);
+
+  const closeSourceFileEditWarning = useCallback(() => {
+    sourceFileEditWarningContinuationRef.current = null;
+    setShowSourceFileEditWarning(false);
+  }, []);
+
+  const confirmSourceFileEditWarning = useCallback(() => {
+    const continuation = sourceFileEditWarningContinuationRef.current;
+    sourceFileEditWarningContinuationRef.current = null;
+    setShowSourceFileEditWarning(false);
+    void continuation?.();
+  }, []);
+
   // Global keyboard shortcuts (Cmd/Ctrl+Enter to submit)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -2184,6 +2193,7 @@ const App: React.FC = () => {
 
       // Don't intercept if any modal is open
       if (showExport || showImport || showFeedbackPrompt || showClaudeCodeWarning ||
+          showSourceFileEditWarning ||
           showExitWarning || showAgentWarning || showPermissionModeSetup || pendingPasteImage) return;
 
       // Don't intercept if already submitted, submitting, or exiting
@@ -2217,28 +2227,35 @@ const App: React.FC = () => {
       // Otherwise: send feedback.
       if (annotateMode) {
         if (gate && !hasFeedbackToSend) {
+          if (maybeConfirmUnsavedSourceFileEdits('approve', () => handleAnnotateApprove())) return;
           handleAnnotateApprove();
           return;
         }
+        if (maybeConfirmUnsavedSourceFileEdits('send-feedback', () => handleAnnotateFeedback())) return;
         handleAnnotateFeedback();
         return;
       }
 
       // No feedback → Approve, otherwise → Send Feedback
       if (!hasFeedbackToSend) {
-        // Check if agent exists for OpenCode users
-        if (origin === 'opencode') {
-          const warning = getAgentWarning();
-          if (warning) {
-            setAgentWarningMessage(warning);
-            setShowAgentWarning(true);
-            return;
+        const approve = () => {
+          // Check if agent exists for OpenCode users
+          if (origin === 'opencode') {
+            const warning = getAgentWarning();
+            if (warning) {
+              setAgentWarningMessage(warning);
+              setShowAgentWarning(true);
+              return;
+            }
           }
-        }
-        handleApprove();
+          handleApprove();
+        };
+        if (maybeConfirmUnsavedSourceFileEdits('approve', approve)) return;
+        approve();
       } else {
         // Direct edits route through deny too: on Claude Code, deny is the only
         // channel whose output carries feedback to the agent.
+        if (maybeConfirmUnsavedSourceFileEdits('send-feedback', () => handleDeny())) return;
         handleDeny();
       }
     };
@@ -2246,11 +2263,12 @@ const App: React.FC = () => {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [
-    showExport, showImport, showFeedbackPrompt, showClaudeCodeWarning, showExitWarning, showAgentWarning,
+    showExport, showImport, showFeedbackPrompt, showClaudeCodeWarning, showSourceFileEditWarning, showExitWarning, showAgentWarning,
     showPermissionModeSetup, pendingPasteImage,
     submitted, isSubmitting, isExiting, goalSetupAction.isSubmitting, isApiMode, isEditingMarkdown, linkedDocHook.isActive, annotations.length, codeAnnotations.length, externalAnnotations.length, annotateMode,
     gate, hasFeedbackToSend, goalSetupMode, goalSetupAction.canSubmit,
     annotateSource, origin, getAgentWarning,
+    maybeConfirmUnsavedSourceFileEdits,
   ]);
 
   const handleAddAnnotation = (ann: Annotation) => {
@@ -2750,6 +2768,7 @@ const App: React.FC = () => {
         sourceSave: nextSourceSave,
       });
       const normalizedEdited = edited.replace(/\r\n?/g, '\n');
+      const savedChangedFromOpen = normalizedEdited !== activeDocument.sessionOpenText;
       editedMarkdownRef.current = null;
       if (editableDocuments.getActiveKey() === activeDocument.key) {
         const live = markdownEditorHandleRef.current?.getMarkdown();
@@ -2766,6 +2785,10 @@ const App: React.FC = () => {
           setEditorDiffersFromBaseline(true);
           setEditStats(computeEditStats(normalizedEdited, currentText));
         }
+      }
+      if (savedChangedFromOpen && window.innerWidth >= 768) {
+        setRightSidebarTab('annotations');
+        setIsPanelOpen(true);
       }
       scheduleDraftSave();
       toast.success(`Saved ${activeSourceSave.basename}`);
@@ -2817,6 +2840,7 @@ const App: React.FC = () => {
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
       if (showExport || showFeedbackPrompt || showClaudeCodeWarning ||
+          showSourceFileEditWarning ||
           showExitWarning || showAgentWarning || showPermissionModeSetup || pendingPasteImage) return;
 
       if (submitted || !isApiMode) return;
@@ -2851,7 +2875,7 @@ const App: React.FC = () => {
     window.addEventListener('keydown', handleSaveShortcut);
     return () => window.removeEventListener('keydown', handleSaveShortcut);
   }, [
-    showExport, showFeedbackPrompt, showClaudeCodeWarning, showExitWarning, showAgentWarning,
+    showExport, showFeedbackPrompt, showClaudeCodeWarning, showSourceFileEditWarning, showExitWarning, showAgentWarning,
     showPermissionModeSetup, pendingPasteImage,
     submitted, isApiMode, isEditingMarkdown, handleSaveEditedSourceFile, displayedMarkdown, annotationsOutput,
   ]);
@@ -2865,6 +2889,7 @@ const App: React.FC = () => {
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
       if (showExport || showFeedbackPrompt || showClaudeCodeWarning ||
+          showSourceFileEditWarning ||
           showExitWarning || showAgentWarning || showPermissionModeSetup || pendingPasteImage) return;
 
       if (submitted) return;
@@ -2876,7 +2901,7 @@ const App: React.FC = () => {
     window.addEventListener('keydown', handlePrintShortcut);
     return () => window.removeEventListener('keydown', handlePrintShortcut);
   }, [
-    showExport, showFeedbackPrompt, showClaudeCodeWarning, showExitWarning, showAgentWarning,
+    showExport, showFeedbackPrompt, showClaudeCodeWarning, showSourceFileEditWarning, showExitWarning, showAgentWarning,
     showPermissionModeSetup, pendingPasteImage, submitted,
   ]);
 
@@ -2913,53 +2938,74 @@ const App: React.FC = () => {
   };
 
   const handleHeaderAnnotateExit = useCallback(() => {
-    if (hasFeedbackToSend) {
-      setExitWarningAction('close');
-      setShowExitWarning(true);
-    } else {
-      headerHandlersRef.current.handleAnnotateExit();
-    }
-  }, [hasFeedbackToSend]);
+    const close = () => {
+      if (hasFeedbackToSend) {
+        setExitWarningAction('close');
+        setShowExitWarning(true);
+      } else {
+        headerHandlersRef.current.handleAnnotateExit();
+      }
+    };
+    if (maybeConfirmUnsavedSourceFileEdits('close', close)) return;
+    close();
+  }, [hasFeedbackToSend, maybeConfirmUnsavedSourceFileEdits]);
 
   const handleHeaderFeedback = useCallback(() => {
-    const h = headerHandlersRef.current;
-    // Direct edits count as feedback — deny is the only Claude Code channel
-    // whose output carries feedback to the agent.
-    if (!hasFeedbackToSend) {
-      setShowFeedbackPrompt(true);
-    } else {
-      h.handleDeny();
-    }
-  }, [hasFeedbackToSend]);
+    const sendFeedback = () => {
+      const h = headerHandlersRef.current;
+      // Direct edits count as feedback — deny is the only Claude Code channel
+      // whose output carries feedback to the agent.
+      if (!hasFeedbackToSend) {
+        setShowFeedbackPrompt(true);
+      } else {
+        h.handleDeny();
+      }
+    };
+    if (maybeConfirmUnsavedSourceFileEdits('send-feedback', sendFeedback)) return;
+    sendFeedback();
+  }, [hasFeedbackToSend, maybeConfirmUnsavedSourceFileEdits]);
 
   const handleHeaderApprove = useCallback(() => {
-    const h = headerHandlersRef.current;
-    if (annotateMode) {
-      if (hasFeedbackToSend) {
-        setExitWarningAction('approve');
-        setShowExitWarning(true);
+    const approve = () => {
+      const h = headerHandlersRef.current;
+      if (annotateMode) {
+        if (hasFeedbackToSend) {
+          setExitWarningAction('approve');
+          setShowExitWarning(true);
+          return;
+        }
+        h.handleAnnotateApprove();
         return;
       }
-      h.handleAnnotateApprove();
-      return;
-    }
-    if (origin === 'claude-code' && hasFeedbackToSend) {
-      setShowClaudeCodeWarning(true);
-      return;
-    }
-    if (origin === 'opencode') {
-      const warning = h.getAgentWarning();
-      if (warning) {
-        setAgentWarningMessage(warning);
-        setShowAgentWarning(true);
+      if (origin === 'claude-code' && hasFeedbackToSend) {
+        setShowClaudeCodeWarning(true);
         return;
       }
-    }
-    h.handleApprove();
-  }, [annotateMode, hasFeedbackToSend, origin]);
+      if (origin === 'opencode') {
+        const warning = h.getAgentWarning();
+        if (warning) {
+          setAgentWarningMessage(warning);
+          setShowAgentWarning(true);
+          return;
+        }
+      }
+      h.handleApprove();
+    };
+    if (maybeConfirmUnsavedSourceFileEdits('approve', approve)) return;
+    approve();
+  }, [annotateMode, hasFeedbackToSend, maybeConfirmUnsavedSourceFileEdits, origin]);
 
-  const handleHeaderAnnotateFeedback = useCallback(() => headerHandlersRef.current.handleAnnotateFeedback(), []);
-  const handleHeaderAnnotateApprove = useCallback(() => headerHandlersRef.current.handleAnnotateApprove(), []);
+  const handleHeaderAnnotateFeedback = useCallback(() => {
+    const sendFeedback = () => headerHandlersRef.current.handleAnnotateFeedback();
+    if (maybeConfirmUnsavedSourceFileEdits('send-feedback', sendFeedback)) return;
+    sendFeedback();
+  }, [maybeConfirmUnsavedSourceFileEdits]);
+
+  const handleHeaderAnnotateApprove = useCallback(() => {
+    const approve = () => headerHandlersRef.current.handleAnnotateApprove();
+    if (maybeConfirmUnsavedSourceFileEdits('approve', approve)) return;
+    approve();
+  }, [maybeConfirmUnsavedSourceFileEdits]);
   const handleHeaderDownloadAnnotations = useCallback(() => headerHandlersRef.current.handleDownloadAnnotations(), []);
   const handleHeaderCopyAgentInstructions = useCallback(() => headerHandlersRef.current.handleCopyAgentInstructions(), []);
   const handleHeaderCopyShareLink = useCallback(() => headerHandlersRef.current.handleCopyShareLink(), []);
@@ -3031,7 +3077,7 @@ const App: React.FC = () => {
           aiAvailable={canUseAI}
           isAIChatOpen={isPanelOpen && rightSidebarTab === 'ai'}
           aiHasMessages={aiMessages.length > 0}
-          hasAnyAnnotations={hasAnyAnnotations || hasDirectEdits}
+          hasAnyAnnotations={hasAnyAnnotations || hasDirectEdits || hasSavedFileChanges}
           linkedDocIsActive={linkedDocHook.isActive}
           callbackShareUrlReady={callbackConfig ? Boolean(shareUrl || shortShareUrl || (renderAs === 'html' && (shareHtml || rawHtml))) : true}
           canShareCurrentSession={canShareCurrentSession}
@@ -3347,14 +3393,6 @@ const App: React.FC = () => {
                                         : 'text-muted-foreground/50 hover:text-muted-foreground'
                                   }`}
                                 >
-                                  {/* Dot slot is always present — only its color changes — so the
-                                      button never reflows when edits appear/clear. */}
-                                  <span
-                                    aria-hidden
-                                    className={`h-1.5 w-1.5 shrink-0 rounded-full transition-colors duration-150 ${
-                                      saveFailed ? 'bg-destructive' : emphasizeSave ? 'bg-primary' : 'bg-transparent'
-                                    }`}
-                                  />
                                   {/* Invisible widest label reserves the width so Save/Saving/Saved
                                       swap without nudging neighbors (font-agnostic, no fixed px). */}
                                   <span className="grid justify-items-start">
@@ -3367,6 +3405,14 @@ const App: React.FC = () => {
                                           : 'Saved'}
                                     </span>
                                   </span>
+                                  {/* Dot slot is always present — only its color changes — so the
+                                      button never reflows when edits appear/clear. */}
+                                  <span
+                                    aria-hidden
+                                    className={`h-1.5 w-1.5 shrink-0 rounded-full transition-colors duration-150 ${
+                                      saveFailed ? 'bg-destructive' : emphasizeSave ? 'bg-primary' : 'bg-transparent'
+                                    }`}
+                                  />
                                 </button>
                               </Tooltip>
                               <span aria-hidden className="text-muted-foreground/30 select-none">|</span>
@@ -3526,7 +3572,7 @@ const App: React.FC = () => {
             otherFileAnnotations={otherFileAnnotations}
             directEdits={directEditsPanelInfo?.map((item) => ({
               ...item,
-              onDiscard: () => handleDiscardEdits(item.sourceKey),
+              onDiscard: item.id === 'plan' ? () => handleDiscardEdits() : undefined,
             })) ?? null}
             onOtherFileAnnotationsClick={handleFlashAnnotatedFiles}
           />
@@ -3642,6 +3688,30 @@ const App: React.FC = () => {
               : `To provide feedback, select text and add annotations. ${agentName} will use your annotations to revise the ${annotateMode ? 'document' : 'plan'}.`
           }
           variant="info"
+        />
+
+        {/* Unsaved source-file edit warning dialog */}
+        <ConfirmDialog
+          isOpen={showSourceFileEditWarning}
+          onClose={closeSourceFileEditWarning}
+          onConfirm={confirmSourceFileEditWarning}
+          title={sourceFileEditWarningAction === 'close' ? 'Unsaved File Edits' : "File Edits Won't Be Sent"}
+          message={
+            sourceFileEditWarningAction === 'close'
+              ? <>You have unsaved file edits. They are not saved to disk and will be lost if you close this session.</>
+              : <>You have unsaved file edits. They are not saved to disk, and {agentName} won't get them if you {sourceFileEditWarningAction === 'approve' ? 'approve' : 'send feedback'}.</>
+          }
+          subMessage="Save or discard the file edits first if you want Plannotator to keep them."
+          confirmText={
+            sourceFileEditWarningAction === 'approve'
+              ? 'Approve Anyway'
+              : sourceFileEditWarningAction === 'close'
+                ? 'Close Anyway'
+                : 'Send Anyway'
+          }
+          cancelText="Cancel"
+          variant="warning"
+          showCancel
         />
 
         {/* Claude Code feedback warning dialog */}
