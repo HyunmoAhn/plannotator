@@ -18,9 +18,9 @@ import type { AgentJobInfo, AgentCapabilities } from '../types';
 import { isTerminalStatus } from '@plannotator/shared/agent-jobs';
 import { cn } from '../lib/utils';
 import { ReviewAgentsIcon } from './ReviewAgentsIcon';
-import { ClaudeIcon, CodexIcon } from './icons/AgentIcons';
+import { ClaudeIcon, CodexIcon, CursorIcon, OpenCodeIcon } from './icons/AgentIcons';
 import { useAgentSettings } from '../hooks/useAgentSettings';
-import type { AgentEngine, AgentMode } from '../hooks/useAgentSettings';
+import type { AgentEngine, AgentMode, ReviewEngine } from '../hooks/useAgentSettings';
 
 // --- Agent option catalogs (shared across review + tour engine dropdowns) ---
 
@@ -71,6 +71,22 @@ const TOUR_CLAUDE_MODELS: Array<{ value: string; label: string }> = [
   { value: 'opus', label: 'Opus (thorough)' },
 ];
 
+// Fallback Cursor model catalog (just `auto`). The real, account-specific list
+// is discovered server-side via `agent models` and delivered on the cursor
+// capability; the component prefers that and only falls back to this when the
+// server reports no models (e.g. unauthenticated CLI). Used by formatModel for
+// job-card labels where the live list isn't threaded.
+const CURSOR_MODELS: Array<{ value: string; label: string }> = [
+  { value: 'auto', label: 'Auto' },
+];
+
+// Fallback OpenCode model catalog. The real list is discovered server-side via
+// `opencode models` and delivered on the opencode capability; empty value means
+// "use OpenCode's configured default".
+const OPENCODE_MODELS: Array<{ value: string; label: string }> = [
+  { value: '', label: 'Default' },
+];
+
 const MODE_LABEL: Record<AgentMode, string> = {
   review: 'Code Review',
   tour: 'Code Tour',
@@ -84,6 +100,23 @@ const ENGINE_LABEL: Record<AgentEngine, string> = {
 const ENGINE_ICON: Record<AgentEngine, React.FC<{ className?: string }>> = {
   claude: ClaudeIcon,
   codex: CodexIcon,
+};
+
+// Review-only label map. Keeps Tour's narrow AgentEngine maps valid while the
+// review surface offers the wider set (Cursor/OpenCode).
+const REVIEW_ENGINE_LABEL: Record<ReviewEngine, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  cursor: 'Cursor',
+  opencode: 'OpenCode',
+};
+
+// Review-only icon map — the wide set. Tour keeps the narrow ENGINE_ICON.
+const REVIEW_ENGINE_ICON: Record<ReviewEngine, React.FC<{ className?: string }>> = {
+  claude: ClaudeIcon,
+  codex: CodexIcon,
+  cursor: CursorIcon,
+  opencode: OpenCodeIcon,
 };
 
 interface AgentsTabProps {
@@ -154,6 +187,8 @@ function catalogLabel(list: Array<{ value: string; label: string }>, value: stri
 }
 
 function formatModel(provider: string, engine: string | undefined, model: string): string {
+  if (provider === 'cursor') return catalogLabel(CURSOR_MODELS, model);
+  if (provider === 'opencode') return model ? model : 'Default';
   if (provider === 'codex' || engine === 'codex') return catalogLabel(CODEX_MODELS, model);
   if (provider === 'tour' && engine === 'claude') return catalogLabel(TOUR_CLAUDE_MODELS, model);
   return catalogLabel(CLAUDE_MODELS, model);
@@ -520,6 +555,8 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     codexModel,
     codexReasoning,
     codexFast,
+    cursorModel,
+    opencodeModel,
     tourClaudeModel,
     tourClaudeEffort,
     tourCodexModel,
@@ -534,6 +571,8 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     setCodexModel,
     setCodexReasoning,
     setCodexFast,
+    setCursorModel,
+    setOpencodeModel,
     setTourClaudeModel,
     setTourClaudeEffort,
     setTourCodexModel,
@@ -569,7 +608,27 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
   const claudeAvailable = capabilities?.providers.some((p) => p.id === 'claude' && p.available) ?? false;
   const codexAvailable = capabilities?.providers.some((p) => p.id === 'codex' && p.available) ?? false;
   const tourAvailable = capabilities?.providers.some((p) => p.id === 'tour' && p.available) ?? false;
+  const cursorAvailable = capabilities?.providers.some((p) => p.id === 'cursor' && p.available) ?? false;
+  const opencodeAvailable = capabilities?.providers.some((p) => p.id === 'opencode' && p.available) ?? false;
 
+  // Cursor's model catalog is account-specific and discovered server-side, so
+  // prefer the live list from the capability; fall back to `auto`-only when the
+  // server reports none (e.g. unauthenticated CLI).
+  const cursorModels = useMemo<Array<{ value: string; label: string }>>(() => {
+    const discovered = capabilities?.providers.find((p) => p.id === 'cursor')?.models ?? [];
+    const opts = discovered.map((m) => ({ value: m.id, label: m.label }));
+    return opts.length > 0 ? opts : CURSOR_MODELS;
+  }, [capabilities]);
+
+  // OpenCode models discovered server-side via `opencode models`; prepend the
+  // "Default" option so the user can leave the model to OpenCode's config.
+  const opencodeModels = useMemo<Array<{ value: string; label: string }>>(() => {
+    const discovered = capabilities?.providers.find((p) => p.id === 'opencode')?.models ?? [];
+    const opts = discovered.map((m) => ({ value: m.id, label: m.label }));
+    return opts.length > 0 ? [...OPENCODE_MODELS, ...opts] : OPENCODE_MODELS;
+  }, [capabilities]);
+
+  // Tour engines (narrow union). Cursor is NOT included here — it is review-only.
   const availableEngines = useMemo<AgentEngine[]>(() => {
     const engines: AgentEngine[] = [];
     if (claudeAvailable) engines.push('claude');
@@ -577,15 +636,28 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     return engines;
   }, [claudeAvailable, codexAvailable]);
 
+  // Review engines (wide union) = tour engines + cursor/opencode when available.
+  const availableReviewEngines = useMemo<ReviewEngine[]>(() => {
+    const engines: ReviewEngine[] = [...availableEngines];
+    if (cursorAvailable) engines.push('cursor');
+    if (opencodeAvailable) engines.push('opencode');
+    return engines;
+  }, [availableEngines, cursorAvailable, opencodeAvailable]);
+
   const availableModes = useMemo<AgentMode[]>(() => {
     const modes: AgentMode[] = [];
-    if (availableEngines.length > 0) modes.push('review');
+    if (availableReviewEngines.length > 0) modes.push('review');
     if (tourAvailable && availableEngines.length > 0) modes.push('tour');
     return modes;
-  }, [availableEngines.length, tourAvailable]);
+  }, [availableReviewEngines.length, availableEngines.length, tourAvailable]);
 
   const firstAvailableEngine = availableEngines[0] ?? null;
+  const firstAvailableReviewEngine = availableReviewEngines[0] ?? null;
   const engineAvailable = (engine: AgentEngine) => engine === 'claude' ? claudeAvailable : codexAvailable;
+  const reviewEngineAvailable = (engine: ReviewEngine) =>
+    engine === 'cursor' ? cursorAvailable
+      : engine === 'opencode' ? opencodeAvailable
+      : engineAvailable(engine);
 
   // Reconcile mode + engine choices against live capabilities. Runs when
   // capabilities change or the stored selection becomes invalid.
@@ -594,13 +666,17 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     if (!selectedMode || !availableModes.includes(selectedMode)) {
       setSelectedMode(availableModes[0]);
     }
-    if (!firstAvailableEngine) return;
-    if (!engineAvailable(reviewEngine)) setReviewEngine(firstAvailableEngine);
-    if (!engineAvailable(tourEngine)) setTourEngine(firstAvailableEngine);
+    if (firstAvailableReviewEngine && !reviewEngineAvailable(reviewEngine)) {
+      setReviewEngine(firstAvailableReviewEngine);
+    }
+    if (firstAvailableEngine && !engineAvailable(tourEngine)) {
+      setTourEngine(firstAvailableEngine);
+    }
   }, [
     capabilities,
     availableModes,
     firstAvailableEngine,
+    firstAvailableReviewEngine,
     selectedMode,
     reviewEngine,
     tourEngine,
@@ -608,6 +684,26 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     setReviewEngine,
     setTourEngine,
   ]);
+
+  // Reconcile the saved Cursor/OpenCode model against the live catalog: a
+  // persisted id can go stale after an account switch or discovery loss, and
+  // posting it would fail the launch. Collapse it to the first option (auto/
+  // Default) when it's no longer offered.
+  useEffect(() => {
+    // Only once the engine is actually available — before capabilities load,
+    // cursorModels is just the fallback, and reconciling here would wipe a valid
+    // saved model before the live catalog arrives.
+    if (!cursorAvailable) return;
+    if (!cursorModels.some((m) => m.value === cursorModel)) {
+      setCursorModel(cursorModels[0]?.value ?? 'auto');
+    }
+  }, [cursorAvailable, cursorModels, cursorModel, setCursorModel]);
+  useEffect(() => {
+    if (!opencodeAvailable) return;
+    if (!opencodeModels.some((m) => m.value === opencodeModel)) {
+      setOpencodeModel(opencodeModels[0]?.value ?? '');
+    }
+  }, [opencodeAvailable, opencodeModels, opencodeModel, setOpencodeModel]);
 
   // Annotation counts per job source
   const annotationCounts = useMemo(() => {
@@ -643,12 +739,31 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     : 'builtin:default';
 
   type LaunchParams = Parameters<typeof onLaunch>[0];
-  const buildReviewLaunch = (engine: AgentEngine): LaunchParams => {
+  const buildReviewLaunch = (engine: ReviewEngine): LaunchParams => {
     // Carry the chosen review only when it is a custom one. Absent → the server
     // resolves to the built-in default.
     const review = effectiveReviewProfileId !== 'builtin:default' ? { reviewProfileId: effectiveReviewProfileId } : {};
     if (engine === 'claude') {
       return { provider: 'claude', label: 'Code Review', model: claudeModel, effort: claudeEffort, ...review };
+    }
+    if (engine === 'cursor') {
+      // Omission ⇒ auto: drop the model client-side when it's `auto` so the POST
+      // carries no model and the server lets Cursor pick its default.
+      return {
+        provider: 'cursor',
+        label: 'Code Review',
+        ...(cursorModel && cursorModel.toLowerCase() !== 'auto' ? { model: cursorModel } : {}),
+        ...review,
+      };
+    }
+    if (engine === 'opencode') {
+      // Empty model ⇒ OpenCode's configured default; only send a real model id.
+      return {
+        provider: 'opencode',
+        label: 'Code Review',
+        ...(opencodeModel ? { model: opencodeModel } : {}),
+        ...review,
+      };
     }
     return {
       provider: 'codex',
@@ -674,7 +789,7 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
   // Default pick has nothing to resolve, so it never waits.
   const reviewReady = profilesLoaded || reviewProfileId === 'builtin:default';
   const canLaunch = selectedMode === 'review'
-    ? engineAvailable(reviewEngine) && reviewReady
+    ? reviewEngineAvailable(reviewEngine) && reviewReady
     : selectedMode === 'tour'
       ? tourAvailable && engineAvailable(tourEngine)
       : false;
@@ -692,23 +807,34 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     </div>
   );
 
-  const renderEngineSelect = (value: AgentEngine, onChange: (engine: AgentEngine) => void) => {
-    const StaticIcon = ENGINE_ICON[value];
+  // Icon-button engine row, shared by Tour (narrow claude/codex set) and Review
+  // (wide claude/codex/cursor/opencode set). The caller passes the engine list
+  // plus its icon/label maps so the same control renders four equal options for
+  // Review exactly as it renders two for Tour.
+  function renderEngineSelect<E extends string>(
+    value: E,
+    onChange: (engine: E) => void,
+    engines: E[],
+    iconMap: Record<E, React.FC<{ className?: string }>>,
+    labelMap: Record<E, string>,
+    configLabel: string = 'Engine',
+  ) {
+    const StaticIcon: React.FC<{ className?: string }> = iconMap[value];
     return (
-      <ConfigRow label="Engine" stacked>
-        {availableEngines.length > 1 ? (
+      <ConfigRow label={configLabel} stacked>
+        {engines.length > 1 ? (
           // Tap an agent's mark to pick it — no dropdown.
           <div className="flex items-center gap-1.5">
-            {availableEngines.map((engine) => {
-              const Icon = ENGINE_ICON[engine];
+            {engines.map((engine) => {
+              const Icon: React.FC<{ className?: string }> = iconMap[engine];
               const selected = value === engine;
               return (
                 <button
                   key={engine}
                   type="button"
                   onClick={() => onChange(engine)}
-                  title={ENGINE_LABEL[engine]}
-                  aria-label={ENGINE_LABEL[engine]}
+                  title={labelMap[engine]}
+                  aria-label={labelMap[engine]}
                   aria-pressed={selected}
                   className={cn(
                     'flex h-9 w-9 items-center justify-center rounded-lg border transition-all',
@@ -723,11 +849,33 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
             })}
           </div>
         ) : (
-          renderStaticChoice(ENGINE_LABEL[value], <StaticIcon className="h-4 w-4" />)
+          renderStaticChoice(labelMap[value], <StaticIcon className="h-4 w-4" />)
         )}
       </ConfigRow>
     );
-  };
+  }
+
+  // Cursor and OpenCode share the same review config: an "experimental" note and
+  // a single model picker driven by their live (or fallback) catalog.
+  const renderMarkerEngineConfig = (
+    model: string,
+    models: Array<{ value: string; label: string }>,
+    setModel: (value: string) => void,
+  ) => (
+    <>
+      <div className="flex items-center gap-1.5 text-[10px] text-amber-600 dark:text-amber-400">
+        <span className="rounded bg-amber-500/10 px-1 py-px font-medium">experimental</span>
+        <span className="text-muted-foreground/50">Findings are prompt-enforced</span>
+      </div>
+      <ConfigRow label="Model" stacked>
+        {models.length > 1 ? (
+          <SelectMenu value={model} options={models} onChange={setModel} />
+        ) : (
+          renderStaticChoice(catalogLabel(models, model))
+        )}
+      </ConfigRow>
+    </>
+  );
 
   return (
     <div className="flex flex-col h-full">
@@ -756,6 +904,16 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
 
             {selectedMode === 'review' && (
               <>
+                {/* Provider (engine) picker — icon-button row over the wide set
+                    (claude/codex/cursor/opencode), above the review selector. */}
+                {renderEngineSelect(
+                  reviewEngine,
+                  setReviewEngine,
+                  availableReviewEngines,
+                  REVIEW_ENGINE_ICON,
+                  REVIEW_ENGINE_LABEL,
+                  'Provider',
+                )}
                 <ConfigRow label="Review" stacked>
                   <SelectMenu
                     value={effectiveReviewProfileId}
@@ -764,7 +922,6 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
                     footerAction={{ label: 'Add new review', onClick: () => setAddReviewOpen(true) }}
                   />
                 </ConfigRow>
-                {renderEngineSelect(reviewEngine, setReviewEngine)}
                 {reviewEngine === 'claude' && (
                   <>
                     <ConfigRow label="Model" stacked>
@@ -788,12 +945,14 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
                     </ConfigRow>
                   </>
                 )}
+                {reviewEngine === 'cursor' && renderMarkerEngineConfig(cursorModel, cursorModels, setCursorModel)}
+                {reviewEngine === 'opencode' && renderMarkerEngineConfig(opencodeModel, opencodeModels, setOpencodeModel)}
               </>
             )}
 
             {selectedMode === 'tour' && (
               <>
-                {renderEngineSelect(tourEngine, setTourEngine)}
+                {renderEngineSelect(tourEngine, setTourEngine, availableEngines, ENGINE_ICON, ENGINE_LABEL)}
                 <ConfigRow label="Model" stacked>
                   <SelectMenu
                     value={tourEngine === 'claude' ? tourClaudeModel : tourCodexModel}

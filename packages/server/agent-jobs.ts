@@ -10,6 +10,12 @@
 
 import { formatClaudeLogEvent } from "./claude-review";
 import {
+  MARKER_ENGINES,
+  formatMarkerLogEvent,
+  type MarkerEngine,
+  type MarkerModel,
+} from "./marker-review";
+import {
   type AgentJobInfo,
   type AgentJobEvent,
   type AgentCapability,
@@ -45,6 +51,16 @@ const BASE = "/api/agents";
 const JOBS = `${BASE}/jobs`;
 const JOBS_STREAM = `${JOBS}/stream`;
 const CAPABILITIES = `${BASE}/capabilities`;
+
+// Providers whose command is owned by the server. Client-supplied argv is never
+// spawned for these — buildCommand must produce the command or the launch fails.
+const SERVER_BUILT_PROVIDERS: ReadonlySet<string> = new Set([
+  "claude",
+  "codex",
+  "tour",
+  "cursor",
+  "opencode",
+]);
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -99,6 +115,32 @@ export interface AgentJobHandlerOptions {
   onJobComplete?: (job: AgentJobInfo, meta: { outputPath?: string; stdout?: string; cwd?: string }) => void | Promise<void>;
 }
 
+
+/**
+ * Best-effort model catalog for a marker engine, spawned once. The spawn lives
+ * HERE (per-runtime — Bun.spawn) rather than in marker-review.ts, which must stay
+ * Bun-free for the Pi vendor build. ASYNC so it never blocks the event loop on
+ * the /capabilities request path (a slow/hanging CLI would otherwise freeze every
+ * other in-flight request for up to the timeout). Empty when discovery fails or
+ * the CLI is unauthenticated / has no providers configured — the UI falls back to
+ * the engine's default picker. Account/config-specific, so never hardcoded.
+ */
+async function discoverMarkerModels(engine: MarkerEngine): Promise<MarkerModel[]> {
+  try {
+    const proc = Bun.spawn([engine.binary, ...engine.modelsArgv], {
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: 5000,
+    });
+    const stdout = await new Response(proc.stdout).text();
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) return [];
+    return engine.parseModels(stdout);
+  } catch {
+    return [];
+  }
+}
+
 export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJobHandler {
   const { mode, getServerUrl, getCwd } = options;
 
@@ -109,17 +151,39 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
   const encoder = new TextEncoder();
   let version = 0;
 
-  // --- Capability detection (run once) ---
+  // --- Capability detection: binaries are probed once at construction; marker
+  // model catalogs are discovered LAZILY (see buildCapabilitiesResponse) so a
+  // slow/unauthenticated `<binary> models` spawn never blocks review-server
+  // startup — it runs at most once, on the first /capabilities request. ---
   const capabilities: AgentCapability[] = [
     { id: "claude", name: "Claude Code", available: !!Bun.which("claude") },
     { id: "codex", name: "Codex CLI", available: !!Bun.which("codex") },
     { id: "tour", name: "Code Tour", available: !!Bun.which("claude") || !!Bun.which("codex") },
   ];
-  const capabilitiesResponse: AgentCapabilities = {
-    mode,
-    providers: capabilities,
-    available: capabilities.some((c) => c.available),
-  };
+  // Marker engines (Cursor, OpenCode) — same shape, one loop. Available only in
+  // review mode when the binary is on PATH (NOTE: cursor's binary is `agent`).
+  for (const engine of Object.values(MARKER_ENGINES)) {
+    capabilities.push({
+      id: engine.id,
+      name: engine.name,
+      available: mode === "review" && !!Bun.which(engine.binary),
+    });
+  }
+
+  const markerModelsCache = new Map<string, MarkerModel[]>();
+  async function buildCapabilitiesResponse(): Promise<AgentCapabilities> {
+    const providers = await Promise.all(capabilities.map(async (c) => {
+      const engine = MARKER_ENGINES[c.id as "cursor" | "opencode"];
+      if (!engine || !c.available) return c;
+      let models = markerModelsCache.get(engine.id);
+      if (!models) {
+        models = await discoverMarkerModels(engine);
+        markerModelsCache.set(engine.id, models);
+      }
+      return { ...c, models };
+    }));
+    return { mode, providers, available: providers.some((p) => p.available) };
+  }
 
   // --- SSE broadcasting ---
   function broadcast(event: AgentJobEvent): void {
@@ -241,32 +305,46 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
       let stdoutBuf = "";
       const stdoutDone = (captureStdout && proc.stdout && typeof proc.stdout !== "number")
         ? (async () => {
+            // Format one complete JSONL line into a live-log delta (skip result
+            // events — those are handled in onJobComplete).
+            const emitLogLine = (line: string) => {
+              if (!line.trim()) return;
+              // Claude: format JSONL into readable text. Tour jobs with the
+              // Claude engine also stream Claude JSONL, so key off engine too.
+              if (provider === "claude" || spawnOptions?.engine === "claude") {
+                const formatted = formatClaudeLogEvent(line);
+                if (formatted !== null) broadcast({ type: "job:log", jobId: id, delta: formatted + '\n' });
+                return;
+              }
+              // Marker engines (Cursor, OpenCode): map their NDJSON stream events
+              // into readable log deltas via the engine's own formatter (Cursor
+              // applies the partial-output dedup rule; OpenCode reads text parts).
+              const markerEngine = MARKER_ENGINES[provider as "cursor" | "opencode"];
+              if (markerEngine) {
+                const formatted = formatMarkerLogEvent(line, markerEngine);
+                if (formatted !== null) broadcast({ type: "job:log", jobId: id, delta: formatted + '\n' });
+                return;
+              }
+              try {
+                const event = JSON.parse(line);
+                if (event.type === 'result') return;
+              } catch { /* not JSON — forward as raw log */ }
+              broadcast({ type: "job:log", jobId: id, delta: line + '\n' });
+            };
             try {
               const reader = proc!.stdout as unknown as AsyncIterable<Uint8Array>;
+              // stream-json output is NDJSON and chunk boundaries are arbitrary —
+              // carry the trailing partial line until a later chunk completes it,
+              // otherwise records split across chunks are dropped from live logs.
+              let logLineCarry = "";
               for await (const chunk of reader) {
                 const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
                 stdoutBuf += text;
-
-                // Forward JSONL lines as log events (skip result events)
-                const lines = text.split('\n');
-                for (const line of lines) {
-                  if (!line.trim()) continue;
-                  // Claude: format JSONL into readable text. Tour jobs with the
-                  // Claude engine also stream Claude JSONL, so key off engine too.
-                  if (provider === "claude" || spawnOptions?.engine === "claude") {
-                    const formatted = formatClaudeLogEvent(line);
-                    if (formatted !== null) {
-                      broadcast({ type: "job:log", jobId: id, delta: formatted + '\n' });
-                    }
-                    continue;
-                  }
-                  try {
-                    const event = JSON.parse(line);
-                    if (event.type === 'result') continue; // handled in onJobComplete
-                  } catch { /* not JSON — forward as raw log */ }
-                  broadcast({ type: "job:log", jobId: id, delta: line + '\n' });
-                }
+                const lines = (logLineCarry + text).split('\n');
+                logLineCarry = lines.pop() ?? "";
+                for (const line of lines) emitLogLine(line);
               }
+              if (logLineCarry) emitLogLine(logLineCarry);
             } catch {
               // Stream closed
             }
@@ -299,8 +377,17 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
               stdout: captureStdout ? stdoutBuf : undefined,
               cwd: jobCwd,
             });
-          } catch {
-            // Result ingestion failure shouldn't prevent job completion broadcast
+          } catch (err) {
+            // Claude/Codex are fail-open: an ingestion error is logged but does
+            // not change the terminal state. Cursor and OpenCode are fail-closed
+            // — their findings are prompt-enforced, so an unexpected throw here
+            // must surface as a failed job rather than a green one. (Their
+            // handlers normally fail by mutation and never throw; this guards
+            // future refactors.)
+            if (MARKER_ENGINES[provider as "cursor" | "opencode"]) {
+              entry.info.status = "failed";
+              entry.info.error = err instanceof Error ? err.message : `${provider} result ingestion failed`;
+            }
           }
         }
         jobOutputPaths.delete(id);
@@ -370,7 +457,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
     ): Promise<Response | null> {
       // --- GET /api/agents/capabilities ---
       if (url.pathname === CAPABILITIES && req.method === "GET") {
-        return Response.json(capabilitiesResponse);
+        return Response.json(await buildCapabilitiesResponse());
       }
 
       // --- SSE stream ---
@@ -465,6 +552,22 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
               { error: `Unknown or unavailable provider: ${provider}` },
               { status: 400 },
             );
+          }
+
+          // Fail-closed enforcement for server-owned providers: the command MUST
+          // be built server-side. Client-supplied argv is never spawned for these
+          // providers — a null/throwing builder becomes an error, not a fallback.
+          const isServerBuiltProvider = SERVER_BUILT_PROVIDERS.has(provider);
+          if (isServerBuiltProvider) {
+            if (!options.buildCommand) {
+              return Response.json(
+                { error: `Provider ${provider} requires server-built command` },
+                { status: 400 },
+              );
+            }
+            // Discard any client-supplied argv so a null build cleanly hits the
+            // `command.length === 0` guard below instead of falling through.
+            command = [];
           }
 
           // Try server-side command building for known providers

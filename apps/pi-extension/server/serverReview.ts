@@ -91,6 +91,15 @@ import {
 } from "../generated/claude-review.js";
 import { createTourSession, TOUR_EMPTY_OUTPUT_ERROR } from "../generated/tour-review.js";
 import {
+	MARKER_ENGINES,
+	composeMarkerReviewPrompt,
+	buildMarkerCommand,
+	parseMarkerStreamOutput,
+	transformMarkerFindings,
+	makeMarkerNonce,
+	extractMarkerNonce,
+} from "../generated/marker-review.js";
+import {
 	WorkspaceReviewSession,
 	type WorkspaceDiffType,
 } from "../generated/review-workspace.js";
@@ -588,6 +597,24 @@ export async function startReviewServer(options: {
 				return { command, stdinPrompt, prompt, cwd, label: jobLabel, captureStdout: true, model, effort, prUrl: launchPrUrl, diffScope: launchDiffScope, diffContext, reviewProfileId: reviewProfile.id, reviewProfileLabel: reviewProfile.label };
 			}
 
+			// Marker engines (Cursor, OpenCode) — one branch, same shape as Claude.
+			// Neither CLI has a schema flag, so composeMarkerReviewPrompt ALWAYS
+			// appends the marker-block output contract (even for a custom profile —
+			// it's the only thing that makes their prose output parseable). The
+			// engine's buildArgv passes the prompt as the trailing positional arg and
+			// threads the spawn cwd (--workspace for Cursor, --dir for OpenCode).
+			// captureStdout is required: the marker block comes back on stdout NDJSON.
+			const markerEngine = MARKER_ENGINES[provider as "cursor" | "opencode"];
+			if (markerEngine) {
+				const model = typeof config?.model === "string" && config.model ? config.model : undefined;
+				// Per-job nonce embedded in the marker contract; recovered from job.prompt
+				// at parse time so echoed/quoted bare tags can't be mistaken for the payload.
+				const nonce = makeMarkerNonce();
+				const prompt = composeMarkerReviewPrompt(reviewProfile, userMessage, nonce);
+				const { command } = buildMarkerCommand(markerEngine, prompt, model, cwd);
+				return { command, prompt, cwd, label: jobLabel, captureStdout: true, model, prUrl: launchPrUrl, diffScope: launchDiffScope, diffContext, reviewProfileId: reviewProfile.id, reviewProfileLabel: reviewProfile.label };
+			}
+
 			return null;
 		},
 
@@ -612,7 +639,7 @@ export async function startReviewServer(options: {
 			// Map findings onto annotations and ingest. Shared by both engine branches;
 			// no-ops on an empty set so a clean (zero-finding) review stays "done".
 			const ingest = <T extends object>(transformed: readonly T[], logTag: string) => {
-				if (transformed.length === 0) return;
+				if (transformed.length === 0) return undefined;
 				const annotations = transformed.map((a) => ({
 					...a,
 					...jobPrContext,
@@ -621,6 +648,7 @@ export async function startReviewServer(options: {
 				}));
 				const result = externalAnnotations.addAnnotations({ annotations });
 				if ("error" in result) console.error(`[${logTag}] addAnnotations error:`, result.error);
+				return result;
 			};
 
 			if (job.provider === "codex") {
@@ -679,6 +707,56 @@ export async function startReviewServer(options: {
 				};
 
 				ingest(transformed, "claude-review");
+				return;
+			}
+
+			// --- Marker path (Cursor, OpenCode) ---
+			// FAIL-CLOSED: marker output is prompt-enforced (no schema flag), so any
+			// missing/malformed/schema/transform/insertion failure must MUTATE the job
+			// to failed — NEVER throw (agent-jobs.ts swallows throws, silently leaving
+			// an exit-0 job marked done). Mirrors the Tour fail-closed pattern below.
+			// Findings carry nullable file/line, classified into line/whole-file/
+			// general by transformMarkerFindings — nothing is dropped (same as Claude).
+			const markerEngine = MARKER_ENGINES[job.provider as "cursor" | "opencode"];
+			if (markerEngine) {
+				// Recover the per-job nonce embedded in the prompt; without it no block
+				// can be trusted, so parse fails closed below.
+				const nonce = extractMarkerNonce(job.prompt ?? "");
+				const output = nonce && meta.stdout ? parseMarkerStreamOutput(meta.stdout, markerEngine, nonce) : null;
+				if (!output) {
+					job.status = "failed";
+					job.error = `${markerEngine.author} review output missing or unparseable (no valid marker JSON).`;
+					return;
+				}
+
+				// Derive the verdict from finding severities (like Claude) rather than
+				// trusting the model's free-form `correctness` string. Marker engines
+				// have no schema flag, so a model value like "not correct" would be
+				// stored verbatim and the detail panel (any string containing "correct"
+				// except "incorrect" → green) would invert the displayed result.
+				const hasImportant = output.findings.some((f) => f.severity === "important");
+				job.summary = {
+					correctness: hasImportant ? "Issues Found" : "Correct",
+					explanation: output.summary.explanation,
+					confidence: output.summary.confidence,
+				};
+
+				// Reuse the shared ingest() decoration; add a fail-closed check on result.
+				const result = ingest(
+					transformMarkerFindings(
+						output.findings,
+						job.source,
+						markerEngine.author,
+						cwd,
+						workspace ? (filePath) => workspace.normalizeAnnotationPath(filePath) : undefined,
+					),
+					`${markerEngine.id}-review`,
+				);
+				if (result && "error" in result) {
+					job.status = "failed";
+					job.error = `${markerEngine.author} annotation insertion failed: ${result.error}`;
+					return;
+				}
 				return;
 			}
 
