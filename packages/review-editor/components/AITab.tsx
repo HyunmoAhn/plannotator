@@ -59,7 +59,10 @@ export const AITab: React.FC<AITabProps> = ({
   hasAISession = false,
 }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
+  // File chat groups default to expanded; this tracks the ones the user has
+  // explicitly collapsed (inverted set), so a freshly-shown file's chat is
+  // visible without a click.
+  const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(new Set());
   const [generalInput, setGeneralInput] = useState('');
   const [highlightFilePath, setHighlightFilePath] = useState<string | null>(null);
 
@@ -92,13 +95,13 @@ export const AITab: React.FC<AITabProps> = ({
     return { fileGroups, generalMessages: general };
   }, [messages]);
 
-  // Auto-expand active file's group
+  // Navigating to a file re-expands its group even if the user had collapsed it.
   useEffect(() => {
     if (activeFilePath) {
-      setExpandedFiles(prev => {
-        if (prev.has(activeFilePath)) return prev;
+      setCollapsedFiles(prev => {
+        if (!prev.has(activeFilePath)) return prev;
         const next = new Set(prev);
-        next.add(activeFilePath);
+        next.delete(activeFilePath);
         return next;
       });
     }
@@ -120,7 +123,7 @@ export const AITab: React.FC<AITabProps> = ({
       setTimeout(() => setHighlightFilePath(null), 1200);
     }
 
-    if (filePath && expandedFiles.has(filePath)) {
+    if (filePath && !collapsedFiles.has(filePath)) {
       setTimeout(() => {
         const el = scrollRef.current?.querySelector(`[data-question-id="${scrollToQuestionId}"]`);
         if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -140,7 +143,7 @@ export const AITab: React.FC<AITabProps> = ({
   }, [latestMessage?.question.id, latestResponseText, messages.length]);
 
   const toggleFile = (filePath: string) => {
-    setExpandedFiles(prev => {
+    setCollapsedFiles(prev => {
       const next = new Set(prev);
       if (next.has(filePath)) next.delete(filePath);
       else next.add(filePath);
@@ -193,7 +196,7 @@ export const AITab: React.FC<AITabProps> = ({
 
         {/* File-grouped questions */}
         {fileGroups.map(({ filePath, messages: fileMessages }) => {
-          const isExpanded = expandedFiles.has(filePath);
+          const isExpanded = !collapsedFiles.has(filePath);
           const basename = filePath.split('/').pop() || filePath;
 
           return (
