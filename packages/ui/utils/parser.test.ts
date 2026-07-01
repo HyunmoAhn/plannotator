@@ -191,6 +191,18 @@ describe("parseMarkdownToBlocks — display math", () => {
     expect(blocks.some((b) => b.content === "More text.")).toBe(true);
   });
 
+  test("unclosed $$ does not pair with a stray $$ inside a later code fence", () => {
+    // The close-tag scan stops at a blank line, so an unterminated $$ can't reach
+    // (and pair with) a $$ that appears far below inside a code fence — which would
+    // otherwise swallow every heading/paragraph in between into one broken block.
+    const md = "$$\n\\theta = x\n\n## Next\n\n```\nnot math $$ here\n```\n\n## After";
+    const blocks = parseMarkdownToBlocks(md);
+    expect(blocks.every((b) => !(b.type === "math" && b.content.length > 100))).toBe(true);
+    expect(blocks.some((b) => b.type === "heading" && b.content === "Next")).toBe(true);
+    expect(blocks.some((b) => b.type === "heading" && b.content === "After")).toBe(true);
+    expect(blocks.some((b) => b.type === "code")).toBe(true);
+  });
+
   test("empty single-line display math does not swallow following content", () => {
     const blocks = parseMarkdownToBlocks("$$$$\n\nAfter");
     expect(blocks.map((b) => b.type)).toEqual(["math", "paragraph"]);

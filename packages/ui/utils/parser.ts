@@ -317,6 +317,11 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
         let j = i;
         while (j + 1 < lines.length) {
           j++;
+          // A blank line ends the search: real $$…$$ has no blank line before its
+          // close, so a blank means this opener was never closed. Stopping here
+          // also prevents matching a stray $$ far below (e.g. inside a later code
+          // fence) and swallowing everything in between.
+          if (lines[j].trim() === '') break;
           const closeAt = lines[j].indexOf('$$');
           if (closeAt !== -1) {
             const before = lines[j].slice(0, closeAt);
@@ -374,6 +379,9 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
         let j = i;
         while (j + 1 < lines.length) {
           j++;
+          // Blank line ends the search (see the $$ branch): unclosed \[ must not
+          // swallow later blocks or match a stray \] inside a later code fence.
+          if (lines[j].trim() === '') break;
           const closeAt = lines[j].indexOf('\\]');
           if (closeAt !== -1) {
             const before = lines[j].slice(0, closeAt);
