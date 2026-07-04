@@ -189,6 +189,11 @@ interface AllFilesCodeViewProps {
   stagedFiles?: Set<string>;
   onStage?: (filePath: string) => void;
   canStageFiles?: boolean;
+  /** Per-file staging gate — false for committed files in since-base mode. The
+   * All-files surface lists committed files too, so mode-level canStageFiles is
+   * not enough; without this the `a` shortcut / header would `git add` a
+   * committed file (a no-op that still flips local staged/viewed state). */
+  canStagePath?: (filePath: string) => boolean;
   stagingFile?: string | null;
   stageError?: string | null;
   prUrl?: string;
@@ -203,6 +208,13 @@ interface AllFilesCodeViewProps {
   onCodeNavRequest?: (request: import('@plannotator/shared/code-nav').CodeNavRequest) => void;
   // File-tree active-file highlight follows scroll.
   onVisibleFileChange?: (filePath: string | null) => void;
+  // Which left panel drives the item order: 'tree' (folders-first visual
+  // order) or 'list' (files array verbatim — the sections view's order).
+  fileOrder?: 'tree' | 'list';
+  // Collapse-all lives in the dock tab strip: register the toggle handler and
+  // mirror the collapsed flag so the header button can drive/reflect it.
+  registerCollapseAllToggle?: (toggle: (() => void) | null) => void;
+  onAllCollapsedChange?: (collapsed: boolean) => void;
   // Only handle [/]/z/v/a/c/x keyboard nav when this surface is the active panel.
   isActive?: boolean;
   // AI props (optional — surfaced into the toolbar). File-aware variants: this
@@ -393,6 +405,7 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
   stagedFiles,
   onStage,
   canStageFiles = false,
+  canStagePath,
   stagingFile,
   stageError,
   prUrl,
@@ -403,6 +416,9 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
   activeSearchMatch = null,
   onCodeNavRequest,
   onVisibleFileChange,
+  fileOrder,
+  registerCollapseAllToggle,
+  onAllCollapsedChange,
   isActive = true,
   aiAvailable = false,
   onAskAIForFile,
@@ -467,12 +483,16 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
   // Previous annotations snapshot for the per-item annotation-sync effect (P4).
   const prevAnnotationsRef = useRef<CodeAnnotation[]>(annotations);
 
-  // Order items by the current visual file-tree order — same ordering the
-  // legacy all-files view uses, so the two surfaces present files identically.
+  // Order items to mirror whichever left panel is active: 'tree' replays the
+  // file-tree's visual order (folders-first); 'list' keeps the files array
+  // order verbatim — which the sections view already arranged top-down
+  // (committed → staged → unstaged → untracked). Scrolling this surface then
+  // always tracks the visible left-panel list one-to-one.
   const visualOrder = useMemo(() => {
+    if (fileOrder === 'list') return files.map((_, index) => index);
     const tree = buildFileTree(files);
     return getVisualFileOrder(tree);
-  }, [files]);
+  }, [files, fileOrder]);
 
   // `initialItems` + the identity maps are recomputed whenever the file set
   // changes. CodeView is uncontrolled (the Diffshub pattern) and only seeds
@@ -514,8 +534,10 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
     // full-stack, same file set) remounts and re-seeds annotations through the
     // current scope filter — the incremental sync bails on an unchanged
     // annotations ref and can't otherwise detect the filter change.
-    () => `${prUrl ?? ''}:${prDiffScope ?? ''}:${files.length}:${files.map((f, i) => `${f.path}#${patchHashes[i]}`).join('|')}`,
-    [files, patchHashes, prUrl, prDiffScope],
+    // fileOrder is part of the key: CodeView seeds initialItems once per
+    // instance, so an order change must remount to re-seed in the new order.
+    () => `${fileOrder ?? 'tree'}:${prUrl ?? ''}:${prDiffScope ?? ''}:${files.length}:${files.map((f, i) => `${f.path}#${patchHashes[i]}`).join('|')}`,
+    [files, patchHashes, prUrl, prDiffScope, fileOrder],
   );
 
   // Visual-order list of file paths (for [/] stepping). Derived from items so it
@@ -825,6 +847,17 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
     setAllItemsCollapsed(anyExpanded);
     setAllCollapsed(anyExpanded);
   });
+
+  // The collapse-all control lives in the dock tab strip, not in this
+  // component — register the handler (and mirror the collapsed flag) so the
+  // header button can drive and reflect this view.
+  useEffect(() => {
+    registerCollapseAllToggle?.(handleToggleAllCollapsed);
+    return () => registerCollapseAllToggle?.(null);
+  }, [registerCollapseAllToggle, handleToggleAllCollapsed]);
+  useEffect(() => {
+    onAllCollapsedChange?.(allCollapsed);
+  }, [onAllCollapsedChange, allCollapsed]);
 
   // Force CodeView to re-render an item's slots (header included) WITHOUT
   // otherwise mutating it. Pierre renders `renderCustomHeader` into a portal
@@ -1725,8 +1758,9 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
         return;
       }
 
-      // a — stage/unstage the current file.
-      if (e.key === 'a' && currentPath && canStageFiles) {
+      // a — stage/unstage the current file (per-file gate: never a committed
+      // file in since-base mode).
+      if (e.key === 'a' && currentPath && (canStagePath ? canStagePath(currentPath) : canStageFiles)) {
         e.preventDefault();
         onStage?.(currentPath);
         return;
@@ -1758,6 +1792,7 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
     onAddFileCommentForFile,
     handleToggleViewedAndCollapse,
     canStageFiles,
+    canStagePath,
     onStage,
   ]);
 
@@ -1788,7 +1823,7 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
         isStaged={stagedFiles?.has(filePath)}
         isStaging={stagingFile === filePath}
         onStage={onStage ? () => onStage(filePath) : undefined}
-        canStage={canStageFiles}
+        canStage={canStagePath ? canStagePath(filePath) : canStageFiles}
         stageError={stagingFile === filePath ? stageError : null}
         onFileComment={onAddFileCommentForFile ? (anchorEl) => handleFileComment(filePath, anchorEl) : undefined}
         // Eager registration so the `c` shortcut can anchor the popover for a
@@ -1960,40 +1995,6 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
 
   return (
     <div className="relative h-full">
-      {/* Floating collapse/expand-all toggle, pinned to the panel's bottom-left
-          corner over the scrolling diff list. Only exists in all-files mode
-          (this component renders only there). */}
-      {identity.items.length > 0 && (
-        <button
-          type="button"
-          onClick={handleToggleAllCollapsed}
-          className="absolute bottom-0 left-0 z-30 flex items-center justify-center h-[var(--panel-header-h)] w-[var(--panel-header-h)] border-r border-t border-border bg-background text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-          title={allCollapsed ? 'Expand all files' : 'Collapse all files'}
-          aria-label={allCollapsed ? 'Expand all files' : 'Collapse all files'}
-        >
-          <svg
-            className="w-3.5 h-3.5"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={2}
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            {allCollapsed ? (
-              <>
-                <path d="M7 9l5-5 5 5" />
-                <path d="M7 15l5 5 5-5" />
-              </>
-            ) : (
-              <>
-                <path d="M7 4l5 5 5-5" />
-                <path d="M7 20l5-5 5 5" />
-              </>
-            )}
-          </svg>
-        </button>
-      )}
       <CodeView<DiffAnnotationMetadata>
         // Remount on diff switch so uncontrolled `initialItems` re-seeds from
         // the freshly computed identity. Without this, switching diff

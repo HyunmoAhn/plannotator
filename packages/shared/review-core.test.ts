@@ -7,12 +7,38 @@ import {
   getDefaultBranch,
   getFileContentsForDiff,
   getGitContext,
+  gitAddFile,
+  gitResetFile,
   listRecentCommits,
   parseWorktreeDiffType,
   runGitDiff,
+  splitPorcelainRename,
   type DiffType,
   type ReviewGitRuntime,
 } from "./review-core";
+
+describe("splitPorcelainRename", () => {
+  test("splits a plain rename on the top-level separator", () => {
+    expect(splitPorcelainRename("old.txt -> new.txt")).toEqual(["old.txt", "new.txt"]);
+  });
+  test("returns a single token for a non-rename path", () => {
+    expect(splitPorcelainRename("src/app.ts")).toEqual(["src/app.ts"]);
+  });
+  test("does NOT split on ` -> ` inside a quoted filename", () => {
+    // A file literally named `weird -> file.txt` is git-quoted; the internal
+    // separator must be ignored so the real file keeps its entry.
+    expect(splitPorcelainRename('"weird -> file.txt"')).toEqual(['"weird -> file.txt"']);
+  });
+  test("splits a rename whose sides are both quoted and contain the separator", () => {
+    expect(splitPorcelainRename('"a -> b.txt" -> "c -> d.txt"')).toEqual([
+      '"a -> b.txt"',
+      '"c -> d.txt"',
+    ]);
+  });
+  test("splits a rename with only the from-side quoted", () => {
+    expect(splitPorcelainRename('"a b.txt" -> new.txt')).toEqual(['"a b.txt"', "new.txt"]);
+  });
+});
 
 const tempDirs: string[] = [];
 
@@ -90,6 +116,69 @@ describe("review-core", () => {
     expect(result.patch).toContain("diff --git a/tracked.txt b/tracked.txt");
     expect(result.patch).toContain("diff --git a/untracked.txt b/untracked.txt");
     expect(result.patch).toContain("+++ b/untracked.txt");
+  });
+
+  test("uncommitted diff includes untracked files with C-quoted (unicode) names", async () => {
+    // git ls-files C-quotes unusual paths ("caf\303\251.txt"); without
+    // unquoting, the --no-index diff can't access the literal quoted name
+    // and the file silently drops out of the review.
+    const repoDir = initRepo();
+    const runtime = makeRuntime(repoDir);
+
+    writeFileSync(join(repoDir, "café.txt"), "accented\n", "utf-8");
+
+    const result = await runGitDiff(runtime, "uncommitted", "main");
+
+    // The content line proves the file was actually read rather than
+    // erroring into an empty diff. The header carries git's C-quoted form
+    // (core.quotePath), so match the escaped bytes there, not "café".
+    expect(result.patch).toContain("+accented");
+    expect(result.patch).toContain("caf\\303\\251.txt");
+  });
+
+  test("file-content working-tree side resolves root-relative paths from a subdirectory CWD", async () => {
+    // Patch paths are repo-root-relative; a review launched from a repo
+    // subdirectory must not resolve them against the launch cwd (that
+    // double-prefixes the path and hunk expansion returns null).
+    const repoDir = initRepo();
+    mkdirSync(join(repoDir, "pkg"), { recursive: true });
+    writeFileSync(join(repoDir, "pkg", "mod.ts"), "before\n", "utf-8");
+    git(repoDir, ["add", "pkg/mod.ts"]);
+    git(repoDir, ["commit", "-m", "add pkg"]);
+    writeFileSync(join(repoDir, "pkg", "mod.ts"), "after\n", "utf-8");
+    writeFileSync(join(repoDir, "tracked.txt"), "root after\n", "utf-8");
+
+    const subCwd = join(repoDir, "pkg");
+    const runtime = makeRuntime(subCwd);
+
+    for (const diffType of ["since-base", "uncommitted", "unstaged"] as const) {
+      // A file inside the subdir (would double-prefix: pkg/pkg/mod.ts)…
+      const sub = await getFileContentsForDiff(runtime, diffType, "main", "pkg/mod.ts", undefined, subCwd);
+      expect(sub.newContent).toBe("after\n");
+      // …and a root-level file (invisible from the subdir entirely).
+      const root = await getFileContentsForDiff(runtime, diffType, "main", "tracked.txt", undefined, subCwd);
+      expect(root.newContent).toBe("root after\n");
+    }
+  });
+
+  test("stage/unstage resolves root-relative pathspecs from a subdirectory CWD", async () => {
+    const repoDir = initRepo();
+    mkdirSync(join(repoDir, "pkg"), { recursive: true });
+    writeFileSync(join(repoDir, "root-new.txt"), "new\n", "utf-8");
+    writeFileSync(join(repoDir, "pkg", "sub-new.txt"), "new\n", "utf-8");
+
+    const subCwd = join(repoDir, "pkg");
+    const runtime = makeRuntime(subCwd);
+
+    // Root-relative paths, subdirectory cwd — `git add` must run at the
+    // toplevel or it fails with "pathspec did not match".
+    await gitAddFile(runtime, "root-new.txt", subCwd);
+    await gitAddFile(runtime, "pkg/sub-new.txt", subCwd);
+    expect(git(repoDir, ["status", "--porcelain"])).toContain("A  root-new.txt");
+    expect(git(repoDir, ["status", "--porcelain"])).toContain("A  pkg/sub-new.txt");
+
+    await gitResetFile(runtime, "root-new.txt", subCwd);
+    expect(git(repoDir, ["status", "--porcelain"])).toContain("?? root-new.txt");
   });
 
   test("uncommitted diff includes untracked files when CWD is a subdirectory", async () => {
@@ -225,6 +314,22 @@ describe("review-core", () => {
     });
   });
 
+  test("getDefaultBranch finds origin/main on feature-only clones (no origin/HEAD, no local main)", async () => {
+    // CI checkouts / `clone --branch feature` / extra worktrees: only the
+    // feature branch exists locally, main lives solely as the fetched
+    // remote-tracking ref. The old chain (origin/HEAD -> local main ->
+    // blind "master") skipped right past it, "master" didn't resolve, and
+    // since-base was suppressed for the whole session.
+    const repoDir = initRepo();
+    const sha = git(repoDir, ["rev-parse", "HEAD"]);
+    git(repoDir, ["checkout", "-b", "feature"]);
+    git(repoDir, ["branch", "-D", "main"]);
+    git(repoDir, ["update-ref", "refs/remotes/origin/main", sha]);
+
+    const runtime = makeRuntime(repoDir);
+    expect(await getDefaultBranch(runtime)).toBe("origin/main");
+  });
+
   test("listRecentCommits returns HEAD ancestry with shortSha and subject", async () => {
     const repoDir = initRepo();
     writeFileSync(join(repoDir, "tracked.txt"), "second\n", "utf-8");
@@ -270,12 +375,14 @@ describe("review-core", () => {
     // "worktree:/path:merge-base" to { path: "/path:merge-base", subType: "uncommitted" }
     // which pointed git at a non-existent cwd and silently collapsed the diff mode.
     const subTypes = [
+      "since-base",
       "uncommitted",
       "staged",
       "unstaged",
       "last-commit",
       "branch",
       "merge-base",
+      "all",
     ] as const;
     for (const sub of subTypes) {
       const composite = `worktree:/tmp/my-worktree:${sub}` as DiffType;

@@ -32,7 +32,11 @@ import {
 import {
 	type DiffType,
 	type GitContext,
+	type RemoteDefaultInfo,
+	type SinceBaseSections,
+	detectRemoteDefaultInfo,
 	getFileContentsForDiff as getFileContentsForDiffCore,
+	getSinceBaseSections,
 	parseWorktreeDiffType,
 	resolveBaseBranch,
 	validateFilePath,
@@ -341,6 +345,9 @@ export async function startReviewServer(options: {
 	// on long awaits (checkout warmup, full recompute) — a request that resumed
 	// after a NEWER scope select or pr-switch must not overwrite their state.
 	let prScopeEpoch = 0;
+	// Monotonic guard for /api/diff/switch (mirrors Bun review.ts) — concurrent
+	// switches would otherwise clobber each other's snapshot across awaits.
+	let diffSwitchEpoch = 0;
 	// Tracks the base branch the user picked from the UI. Agent review prompts
 	// read this (not gitContext.defaultBranch) so they analyze the same diff
 	// the reviewer is currently looking at. Honors an explicit initialBase from
@@ -349,6 +356,42 @@ export async function startReviewServer(options: {
 		options.gitContext?.defaultBranch || options.gitContext?.compareTarget?.fallback || "main";
 	let currentBase = options.initialBase || detectedCompareTarget();
 	let baseEverSwitched = false;
+	// True once the user picks a base from the picker (explicitBase on the
+	// switch body). Disables the bare-local-name → origin/* canonicalization:
+	// the picker offers local and remote refs as distinct choices, so an
+	// explicit local pick must be honored even when the two point at
+	// different commits.
+	let baseExplicitlyChosen = false;
+	const resolveReviewBase = (requestedBase?: string): string => {
+		const resolved = resolveBaseBranch(requestedBase, detectedCompareTarget());
+		// Canonicalize a bare local default name ("main") to its tracking ref
+		// ("origin/main") — the startup upgrade races the first /api/diff, so a
+		// client that loaded early re-sends "main" on the next switch/refresh and
+		// would revert the server to the stale local branch. Only when the remote
+		// default is known, the requested base is exactly its local name, AND the
+		// user has never explicitly picked a base — an explicit local pick (and
+		// every echo after it) is honored verbatim.
+		const remoteBranch = remoteDefaultInfo?.branch;
+		if (
+			!baseExplicitlyChosen &&
+			remoteBranch &&
+			remoteBranch.startsWith("origin/") &&
+			resolved === remoteBranch.replace(/^origin\//, "")
+		) {
+			return remoteBranch;
+		}
+		// Second rule, independent of remoteDefaultInfo: if the SESSION is
+		// already on the upgraded tracking ref and a non-explicit request echoes
+		// its bare local name, stay on the tracking ref. remoteDefaultInfo comes
+		// from a SECOND probe that can lag the startup upgrade by seconds — in
+		// that window the rule above is blind, and a diff-type/whitespace switch
+		// echoing "main" would commit the session back onto the stale local
+		// branch (and set baseEverSwitched, permanently blocking the upgrade).
+		if (!baseExplicitlyChosen && currentBase === `origin/${resolved}`) {
+			return currentBase;
+		}
+		return resolved;
+	};
 
 	// --- Diff staleness fingerprint (mirrors packages/server/review.ts) -------
 	// Captured beside every patch snapshot; GET /api/diff/fresh recomputes and
@@ -401,11 +444,149 @@ export async function startReviewServer(options: {
 	};
 	captureDiffFingerprint();
 
-	// Fire-and-forget: query the remote for its actual default branch.
-	if (options.gitContext && !options.initialBase && !isPRMode) {
-		detectRemoteDefaultCompareTarget(options.gitContext.cwd, sessionVcsType).then((remote) => {
-			if (remote && !baseEverSwitched) currentBase = remote;
-		});
+	// --- Base staleness vs the remote (mirrors Bun review.ts) -----------------
+	// `origin/<default>` is GitHub's state as of the last fetch. The startup
+	// ls-remote also carries the remote tip SHA; comparing it to the local
+	// tracking ref tells us whether the baseline is behind. Refreshed lazily at
+	// most once a minute (network call, unlike the 5s fingerprint probe).
+	let remoteDefaultInfo: RemoteDefaultInfo | null = null;
+	let baseBehindRemote = false;
+	let lastRemoteBaseCheck = 0;
+	const REMOTE_BASE_CHECK_INTERVAL_MS = 60_000;
+	const remoteBaseCheckApplies = (): boolean =>
+		!!options.gitContext && !isPRMode && (!sessionVcsType || sessionVcsType === "git");
+
+	// Only base-relative diff types (since-base / branch / merge-base) care
+	// about the base being behind the remote; the banner must not show under
+	// uncommitted/staged/etc.
+	const baseRelevantDiffType = (): boolean => {
+		const t = parseWorktreeDiffType(currentDiffType as string)?.subType ?? currentDiffType;
+		return t === "since-base" || t === "branch" || t === "merge-base";
+	};
+
+	// Local-only recompute from the cached remote tip — no network.
+	async function recomputeBaseBehindRemote(): Promise<void> {
+		// Capture once: a concurrent refreshRemoteBaseInfo can null
+		// remoteDefaultInfo (transient ls-remote failure) during the rev-parse
+		// await below — reading the global after it would throw.
+		const remoteInfo = remoteDefaultInfo;
+		if (!remoteBaseCheckApplies() || !baseRelevantDiffType() || !remoteInfo?.remoteHeadSha) {
+			baseBehindRemote = false;
+			return;
+		}
+		// Match the remote default branch as either its local name ("main") or
+		// the tracking ref ("origin/main"), and compare by RESOLVED SHA — this is
+		// what makes the check work when currentBase is the bare local name (the
+		// case whenever origin/HEAD's local symref isn't set; Pi forwards that
+		// local name as initialBase).
+		//
+		// A local name the user EXPLICITLY picked is exempt: they chose the local
+		// ref over origin/* on purpose, and Fetch advances origin/* — the banner
+		// would be un-clearable nagging about a deliberate choice (same treatment
+		// as any non-default base).
+		const remoteBranch = remoteInfo.branch;
+		const localName = remoteBranch.replace(/^origin\//, "");
+		const matchesDefault =
+			currentBase === remoteBranch ||
+			(currentBase === localName && !baseExplicitlyChosen);
+		if (!matchesDefault) {
+			baseBehindRemote = false;
+			return;
+		}
+		// --verify: without it, `rev-parse --end-of-options <ref>` echoes the flag
+		// as a literal first output line, so .trim() never equals the SHA and the
+		// banner was stuck true on every repo with a remote.
+		const local = await reviewRuntime.runGit(
+			["--no-optional-locks", "rev-parse", "--verify", "--end-of-options", currentBase],
+			{ cwd: options.gitContext?.cwd },
+		);
+		baseBehindRemote = local.exitCode === 0 && local.stdout.trim() !== remoteInfo.remoteHeadSha;
+	}
+
+	async function refreshRemoteBaseInfo(): Promise<void> {
+		if (!remoteBaseCheckApplies()) return;
+		lastRemoteBaseCheck = Date.now();
+		remoteDefaultInfo = await detectRemoteDefaultInfo(reviewRuntime, options.gitContext?.cwd);
+		await recomputeBaseBehindRemote();
+	}
+
+	function maybeRefreshRemoteBaseInfo(): void {
+		if (!remoteBaseCheckApplies()) return;
+		if (Date.now() - lastRemoteBaseCheck < REMOTE_BASE_CHECK_INTERVAL_MS) return;
+		lastRemoteBaseCheck = Date.now();
+		void refreshRemoteBaseInfo().catch(() => {});
+	}
+
+	// --- Since-base sections sidecar (mirrors Bun review.ts) ------------------
+	function isSinceBaseActive(diffType: string = currentDiffType as string): boolean {
+		if (isPRMode || workspace || !options.gitContext) return false;
+		const effective = parseWorktreeDiffType(diffType)?.subType ?? diffType;
+		return effective === "since-base";
+	}
+	// Base AND diff type are parameterized so callers can pin them to a
+	// snapshot taken before an await — reading the globals inside would race
+	// the startup base upgrade and concurrent diff-type switches.
+	async function buildSectionsSidecar(
+		base: string = currentBase,
+		diffType: string = currentDiffType as string,
+	): Promise<SinceBaseSections | undefined> {
+		if (!isSinceBaseActive(diffType)) return undefined;
+		const cwd = resolveVcsCwd(diffType as DiffType, options.gitContext?.cwd);
+		return (await getSinceBaseSections(reviewRuntime, base, cwd)) ?? undefined;
+	}
+
+	// Decoupled startup probes (a forwarded initialBase must NOT suppress the
+	// staleness check — the Pi divergence): always probe remote staleness, and
+	// only upgrade currentBase to the upstream ref when no explicit base given.
+	// Upgrade currentBase to the upstream tracking ref ("origin/main") when no
+	// explicit base was requested, OR when the forwarded base is just the bare
+	// LOCAL name of that same default ("main"). Only origin/* is fetchable, so
+	// leaving currentBase as bare "main" makes the "behind GitHub" banner
+	// un-clearable (Fetch advances origin/main, not local main). Canonicalizing
+	// "main" -> "origin/main" never overrides a deliberately-chosen feature base.
+	if (options.gitContext && !isPRMode) {
+		const gitCwd = options.gitContext.cwd;
+		detectRemoteDefaultCompareTarget(gitCwd, sessionVcsType).then(
+			async (remote) => {
+				if (remote && !baseEverSwitched && currentBase !== remote) {
+					const localName = remote.replace(/^origin\//, "");
+					if (!options.initialBase || currentBase === localName) {
+						// Rebuild the diff for the upgraded base BEFORE swapping it in, and
+						// commit base+patch+ref+fingerprint together — otherwise the initial
+						// patch (built against the old base) would be served under the new
+						// base label: a mixed-base review. Skip if the user switched meanwhile.
+						try {
+							const rebuilt = await runVcsDiff(
+								currentDiffType as DiffType,
+								remote,
+								gitCwd,
+								{ hideWhitespace: currentHideWhitespace },
+							);
+							if (!baseEverSwitched) {
+								currentBase = remote;
+								currentPatch = rebuilt.patch;
+								currentGitRef = rebuilt.label;
+								currentError = rebuilt.error;
+								// draftKey doubles as the snapshot id the freshness probe
+								// compares against each client's echoed ?snapshot= — a client
+								// that loaded the pre-upgrade patch mismatches and gets the
+								// "Diff out of date · Refresh" banner; later loads carry the
+								// new id and stay fresh. That per-client signal is what lets
+								// the fingerprint re-baseline unconditionally here.
+								draftKey = contentHash(currentPatch);
+								captureDiffFingerprint();
+							}
+						} catch {
+							/* keep the initial base+patch — they still match each other */
+						}
+					}
+				}
+				void refreshRemoteBaseInfo().catch(() => {});
+			},
+			() => {
+				void refreshRemoteBaseInfo().catch(() => {});
+			},
+		);
 	}
 
 	// Agent jobs — background process manager (late-binds serverUrl via getter)
@@ -451,11 +632,30 @@ export async function startReviewServer(options: {
 	// SAME machine the review jobs use (contextOnly=true). Returned in the diff
 	// payloads so the chat latches it onto user messages; recomputed wherever the
 	// view changes. Mirrors packages/server/review.ts buildCurrentAiReviewContext.
-	function buildCurrentAiReviewContext(): string {
+	// Parameterized so response handlers that SNAPSHOT the served state before
+	// an await can build the AI context from that same snapshot — reading the
+	// live globals here would let the startup base upgrade hand Ask AI a
+	// context for a different changeset than the rendered patch.
+	// Snapshot identity clients echo on freshness probes: the content hash
+	// PLUS the view mode. Mode is included so a cross-tab mode switch with a
+	// byte-identical patch (layer vs full-stack on a single-PR stack) still
+	// flags old tabs; the BASE is deliberately excluded so a same-commit base
+	// canonicalization (main -> origin/main) stays banner-silent. draftKey
+	// itself stays a pure content hash — drafts survive content-identical
+	// mode round-trips.
+	function currentSnapshotId(): string {
+		return `${draftKey}:${currentDiffType}${isPRMode ? `:${currentPRDiffScope}` : ""}`;
+	}
+
+	function buildCurrentAiReviewContext(
+		patch: string = currentPatch,
+		base: string = currentBase,
+		diffType: DiffType = currentDiffType as DiffType,
+	): string {
 		const workspacePrompt = getWorkspacePromptContext();
 		if (workspacePrompt) {
 			return buildAgentReviewUserMessageForTarget(
-				{ kind: "workspace", patch: currentPatch, workspace: workspacePrompt },
+				{ kind: "workspace", patch, workspace: workspacePrompt },
 				true,
 			);
 		}
@@ -464,9 +664,9 @@ export async function startReviewServer(options: {
 		const hasLocalAccess = !!options.gitContext ||
 			(options.worktreePool && prMeta ? resolvePRLocalCwd() !== null : !!options.agentCwd);
 		return buildAgentReviewUserMessage(
-			currentPatch,
-			currentDiffType as DiffType,
-			{ defaultBranch: currentBase, hasLocalAccess, prDiffScope: currentPRDiffScope },
+			patch,
+			diffType,
+			{ defaultBranch: base, hasLocalAccess, prDiffScope: currentPRDiffScope },
 			prMeta,
 			true,
 		);
@@ -867,17 +1067,35 @@ export async function startReviewServer(options: {
 		}
 
 		if (url.pathname === "/api/diff" && req.method === "GET") {
+			maybeRefreshRemoteBaseInfo();
+			// Snapshot the served state BEFORE the sidecar await: the startup
+			// base upgrade can land mid-await, and reading the globals after
+			// it would pair a rebuilt patch with sections computed from the
+			// old base — a misgrouped panel. snapshotId travels with the
+			// patch it identifies: a mid-await upgrade bumps draftKey, and
+			// this client's next freshness probe (echoing the OLD id) raises
+			// the Refresh banner for the consistent old snapshot served here.
+			const servedPatch = currentPatch;
+			const servedBase = currentBase;
+			const servedGitRef = currentGitRef;
+			const servedError = currentError;
+			const servedDiffType = currentDiffType;
+			const servedHideWhitespace = currentHideWhitespace;
+			const servedPRDiffScope = currentPRDiffScope;
+			const servedSnapshotId = currentSnapshotId();
+			const sections = await buildSectionsSidecar(servedBase, servedDiffType as string);
 			json(res, {
-				rawPatch: currentPatch,
-				aiReviewContext: buildCurrentAiReviewContext(),
-				gitRef: currentGitRef,
+				rawPatch: servedPatch,
+				aiReviewContext: buildCurrentAiReviewContext(servedPatch, servedBase, servedDiffType as DiffType),
+				gitRef: servedGitRef,
+				snapshotId: servedSnapshotId,
 				origin: options.origin ?? "pi",
 				mode: isWorkspaceMode ? "workspace" : undefined,
-				diffType: hasLocalAccess || isWorkspaceMode ? currentDiffType : undefined,
+				diffType: hasLocalAccess || isWorkspaceMode ? servedDiffType : undefined,
 				// Echo the active base so page refresh/reconnect rehydrates the
 				// picker to what the server is actually using, not the detected default.
-				base: hasLocalAccess ? currentBase : undefined,
-				hideWhitespace: currentHideWhitespace,
+				base: hasLocalAccess ? servedBase : undefined,
+				hideWhitespace: servedHideWhitespace,
 				...(workspace && { diffOptions: workspace.diffOptions }),
 				gitContext: hasLocalAccess ? options.gitContext : undefined,
 				sharingEnabled,
@@ -900,15 +1118,46 @@ export async function startReviewServer(options: {
 					platformUser,
 					prStackInfo,
 					prStackTree,
-					prDiffScope: currentPRDiffScope,
+					prDiffScope: servedPRDiffScope,
 					prDiffScopeOptions,
 				}),
 				...(isPRMode && layerPatchIncomplete && { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable }),
 				...(isPRMode && initialViewedFiles.length > 0 && { viewedFiles: initialViewedFiles }),
-				...(currentError && { error: currentError }),
+				...(sections && { sections }),
+				...(baseBehindRemote && { baseBehindRemote: true }),
+				...(servedError && { error: servedError }),
 				semanticDiff: await getSemanticDiffAdvert(),
 				serverConfig: getServerConfig(gitUser),
 			});
+		} else if (url.pathname === "/api/fetch-base" && req.method === "POST") {
+			// Fetch the remote default branch so the local baseline catches up
+			// with GitHub. Client re-runs /api/diff/switch afterwards.
+			if (!remoteBaseCheckApplies()) {
+				json(res, { error: "Not available in this mode" }, 400);
+				return;
+			}
+			const branchRef =
+				remoteDefaultInfo?.branch ??
+				(currentBase.startsWith("origin/") ? currentBase : null);
+			if (!branchRef) {
+				json(res, { error: "No remote-tracking base to fetch" }, 400);
+				return;
+			}
+			const branchName = branchRef.replace(/^origin\//, "");
+			const result = await reviewRuntime.runGit(
+				["fetch", "--end-of-options", "origin", branchName],
+				{ cwd: options.gitContext?.cwd, timeoutMs: 30_000 },
+			);
+			if (result.exitCode !== 0) {
+				json(res, { error: result.stderr.trim() || "git fetch failed" }, 500);
+				return;
+			}
+			// Re-query the remote (fresh ls-remote) and recompute rather than
+			// trusting a cached tip: a narrow fetch refspec can exit 0 without
+			// advancing refs/remotes/origin/<branch>, so we must observe the
+			// actual post-fetch state instead of silently clearing the banner.
+			await refreshRemoteBaseInfo();
+			json(res, { ok: true, baseBehindRemote });
 		} else if (url.pathname === "/api/diff/fresh" && req.method === "GET") {
 			// Cheap staleness probe — has the underlying VCS state changed since
 			// the current diff snapshot was computed? Best-effort: anything that
@@ -920,8 +1169,25 @@ export async function startReviewServer(options: {
 			// resolves a path only once ready). Non-PR sessions omit this field.
 			const prCwdAdvert = isPRMode ? { agentCwd: resolvePRLocalCwd() } : {};
 			const baseline = currentFingerprint;
+			// Carry baseBehindRemote on EVERY response — the client sets the flag
+			// unconditionally each probe, so omitting it clears the 'behind GitHub'
+			// banner for that poll (a flicker) until the next one.
+			const behind = baseBehindRemote ? { baseBehindRemote: true } : {};
+			// Per-CLIENT staleness: the client echoes the snapshotId it is
+			// rendering; a mismatch means the SERVER's snapshot moved under it
+			// (startup base upgrade, a switch from another tab, an in-place PR
+			// switch) regardless of what the VCS fingerprint says. This is what
+			// lets one server serve multiple tabs holding different snapshots
+			// without lying to any of them. The "snapshot:" fingerprint keys
+			// the client's dismissal to the server snapshot that made it stale.
+			const clientSnapshot = url.searchParams.get("snapshot");
+			const serverSnapshot = currentSnapshotId();
+			if (clientSnapshot && clientSnapshot !== serverSnapshot) {
+				json(res, { fresh: false, fingerprint: `snapshot:${serverSnapshot}`, ...behind, ...prCwdAdvert });
+				return;
+			}
 			if (baseline == null) {
-				json(res, { fresh: true, ...prCwdAdvert });
+				json(res, { fresh: true, ...behind, ...prCwdAdvert });
 				return;
 			}
 			const probe = await computeDiffFingerprint();
@@ -929,16 +1195,26 @@ export async function startReviewServer(options: {
 			// fingerprint); report fresh and let the next poll compare against
 			// the new baseline.
 			if (currentFingerprint !== baseline) {
-				json(res, { fresh: true, ...prCwdAdvert });
+				json(res, { fresh: true, ...behind, ...prCwdAdvert });
 				return;
 			}
 			const fresh = probe == null || probe === baseline;
+			maybeRefreshRemoteBaseInfo();
 			// The probe fingerprint lets the client distinguish "still the same
 			// staleness I dismissed" from "ANOTHER change landed since".
-			json(res, { fresh, ...(fresh ? {} : { fingerprint: probe }), ...prCwdAdvert });
+			json(res, {
+				fresh,
+				...(fresh ? {} : { fingerprint: probe }),
+				...(baseBehindRemote && { baseBehindRemote: true }),
+				...prCwdAdvert,
+			});
 		} else if (url.pathname === "/api/semantic-diff" && req.method === "GET") {
 			json(res, await getSemanticDiff(url));
 		} else if (url.pathname === "/api/diff/switch" && req.method === "POST") {
+			// Capture the ordering token BEFORE any await — body delivery can
+			// finish out of arrival order under network jitter, so capturing after
+			// parseBody let a slow-body OLDER request overwrite a newer one.
+			const switchEpoch = ++diffSwitchEpoch;
 			if (!hasLocalAccess && !workspace) {
 				json(res, { error: "Not available without local file access" }, 400);
 				return;
@@ -950,14 +1226,21 @@ export async function startReviewServer(options: {
 					json(res, { error: "Missing diffType" }, 400);
 					return;
 				}
-				if (typeof body.hideWhitespace === "boolean") {
-					currentHideWhitespace = body.hideWhitespace;
-				}
+				// Don't commit hideWhitespace to shared state until we win the
+				// epoch check — a superseded request must not leave its value.
+				const effectiveHideWhitespace = typeof body.hideWhitespace === "boolean"
+					? body.hideWhitespace
+					: currentHideWhitespace;
 				if (workspace) {
 					const snapshot = await workspace.rebuild({
 						diffType: newType,
-						hideWhitespace: currentHideWhitespace,
+						hideWhitespace: effectiveHideWhitespace,
 					});
+					if (switchEpoch !== diffSwitchEpoch) {
+						json(res, { superseded: true });
+						return;
+					}
+					currentHideWhitespace = effectiveHideWhitespace;
 					currentPatch = snapshot.rawPatch;
 					currentGitRef = snapshot.gitRef;
 					currentDiffType = workspace.diffType;
@@ -967,8 +1250,11 @@ export async function startReviewServer(options: {
 
 					json(res, {
 						rawPatch: currentPatch,
-						aiReviewContext: buildCurrentAiReviewContext(),
+						// Snapshot arg: robust against a future await sneaking in
+						// between the epoch check and this response.
+						aiReviewContext: buildCurrentAiReviewContext(snapshot.rawPatch),
 						gitRef: currentGitRef,
+						snapshotId: currentSnapshotId(),
 						diffType: currentDiffType,
 						diffOptions: workspace.diffOptions,
 						hideWhitespace: currentHideWhitespace,
@@ -977,21 +1263,34 @@ export async function startReviewServer(options: {
 					});
 					return;
 				}
-				const detectedBase = detectedCompareTarget();
-				const base = resolveBaseBranch(
+				// An explicit pick from the base picker is honored verbatim —
+				// the local/remote groups are distinct choices, so "main" must
+				// not be canonicalized to "origin/main" when the user chose the
+				// local ref on purpose. Sticky: later echoes of that choice
+				// (diff-type switches, refreshes) must not re-canonicalize it.
+				if (body.explicitBase === true && typeof body.base === "string" && body.base) {
+					baseExplicitlyChosen = true;
+				}
+				const base = resolveReviewBase(
 					typeof body.base === "string" ? body.base : undefined,
-					detectedBase,
 				);
 				const defaultCwd = options.gitContext?.cwd;
 				const result = await runVcsDiff(newType as DiffType, base, defaultCwd, {
-					hideWhitespace: currentHideWhitespace,
+					hideWhitespace: effectiveHideWhitespace,
 				});
+				// A newer switch superseded us — don't touch shared state.
+				if (switchEpoch !== diffSwitchEpoch) {
+					json(res, { superseded: true });
+					return;
+				}
+				currentHideWhitespace = effectiveHideWhitespace;
 				currentPatch = result.patch;
 				currentGitRef = result.label;
 				currentDiffType = newType;
 				currentBase = base;
 				baseEverSwitched = true;
 				currentError = result.error;
+				draftKey = contentHash(currentPatch);
 				captureDiffFingerprint();
 
 				// Recompute gitContext for the effective cwd so the client's
@@ -1007,10 +1306,27 @@ export async function startReviewServer(options: {
 					}
 				}
 
+				// Base may have changed — re-evaluate behind-ness from the cached
+				// remote tip (cheap, local-only).
+				// Await (not fire-and-forget) so the switch response carries the
+				// freshly-recomputed baseBehindRemote — otherwise the banner lags a
+				// poll cycle switching INTO a base-relative mode, or lingers stale
+				// switching AWAY from one. Local rev-parse only; cheap.
+				await recomputeBaseBehindRemote().catch(() => {});
+				const sections = await buildSectionsSidecar();
+				const switchSemanticDiff = await getSemanticDiffAdvert();
+				// Final guard: a newer switch during trailing awaits wins.
+				if (switchEpoch !== diffSwitchEpoch) {
+					json(res, { superseded: true });
+					return;
+				}
 				json(res, {
 					rawPatch: currentPatch,
-					aiReviewContext: buildCurrentAiReviewContext(),
+					// Snapshot args: robust against a future await sneaking in
+					// between the epoch check and this response.
+					aiReviewContext: buildCurrentAiReviewContext(result.patch, base),
 					gitRef: currentGitRef,
+					snapshotId: currentSnapshotId(),
 					diffType: currentDiffType,
 					// Echo the base the server actually used. resolveBaseBranch
 					// trusts the caller verbatim; this echo lets the client
@@ -1018,9 +1334,11 @@ export async function startReviewServer(options: {
 					// didn't supply one and we fell back to detected default).
 					base: currentBase,
 					hideWhitespace: currentHideWhitespace,
+					...(sections ? { sections } : {}),
+					...(baseBehindRemote ? { baseBehindRemote: true } : {}),
 					...(updatedContext ? { gitContext: updatedContext } : {}),
 					...(currentError ? { error: currentError } : {}),
-					semanticDiff: await getSemanticDiffAdvert(),
+					semanticDiff: switchSemanticDiff,
 				});
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to switch diff";
@@ -1048,6 +1366,7 @@ export async function startReviewServer(options: {
 						rawPatch: currentPatch,
 						aiReviewContext: buildCurrentAiReviewContext(),
 						gitRef: currentGitRef,
+						snapshotId: currentSnapshotId(),
 						prDiffScope: currentPRDiffScope,
 						...(layerPatchIncomplete ? { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable } : {}),
 						...(currentError ? { error: currentError } : {}),
@@ -1099,15 +1418,19 @@ export async function startReviewServer(options: {
 					currentGitRef = originalPRGitRef;
 					currentError = originalPRError;
 					currentPRDiffScope = "layer";
-					// The upgrade changed the patch this session serves; drafts must
-					// key off it so a pr-switch round-trip (which rehashes from the
-					// cache) resolves to the same key.
-					if (!layerPatchIncomplete) draftKey = contentHash(currentPatch);
+					// INVARIANT: every commit point re-keys — draftKey doubles as
+					// the snapshotId clients echo on freshness probes AND the
+					// draft-storage key, so it must always identify currentPatch.
+					// (This was previously conditional on !layerPatchIncomplete,
+					// which only stayed consistent because the full-stack branch
+					// never re-keyed at all.)
+					draftKey = contentHash(currentPatch);
 					captureDiffFingerprint();
 					json(res, {
 						rawPatch: currentPatch,
 						aiReviewContext: buildCurrentAiReviewContext(),
 						gitRef: currentGitRef,
+						snapshotId: currentSnapshotId(),
 						prDiffScope: currentPRDiffScope,
 						...(layerPatchIncomplete ? { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable } : {}),
 						...((currentError ?? upgradeError) ? { error: currentError ?? upgradeError } : {}),
@@ -1135,11 +1458,17 @@ export async function startReviewServer(options: {
 				currentGitRef = result.label;
 				currentError = undefined;
 				currentPRDiffScope = "full-stack";
+				// INVARIANT: every commit point re-keys (see the layer branch).
+				// Skipping this advertised the LAYER snapshot id for the
+				// full-stack patch — stale layer tabs never got the banner and
+				// full-stack drafts collided with layer drafts.
+				draftKey = contentHash(currentPatch);
 				captureDiffFingerprint();
 				json(res, {
 					rawPatch: currentPatch,
 					aiReviewContext: buildCurrentAiReviewContext(),
 					gitRef: currentGitRef,
+					snapshotId: currentSnapshotId(),
 					prDiffScope: currentPRDiffScope,
 					semanticDiff: await getSemanticDiffAdvert(),
 				});
@@ -1222,6 +1551,7 @@ export async function startReviewServer(options: {
 					rawPatch: currentPatch,
 					aiReviewContext: buildCurrentAiReviewContext(),
 					gitRef: currentGitRef,
+					snapshotId: currentSnapshotId(),
 					prMetadata: pr.metadata,
 					// The new PR's checkout (null while warming) so Open-in re-roots
 					// immediately on switch instead of waiting for the 5s probe.
@@ -1411,10 +1741,8 @@ export async function startReviewServer(options: {
 
 			// Local mode first (matches Bun server priority)
 			if (hasLocalAccess && !isPRMode) {
-				const detectedBase = detectedCompareTarget();
-				const base = resolveBaseBranch(
+				const base = resolveReviewBase(
 					url.searchParams.get("base") ?? undefined,
-					detectedBase,
 				);
 				const defaultCwd = options.gitContext?.cwd;
 				const result = await getVcsFileContentsForDiff(

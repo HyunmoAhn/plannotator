@@ -34,6 +34,7 @@ export const ReviewAllFilesDiffPanel: React.FC<IDockviewPanelProps> = () => {
       stagedFiles={state.stagedFiles}
       onStage={state.onStage}
       canStageFiles={state.canStageFiles}
+      canStagePath={state.canStagePath}
       stagingFile={state.stagingFile}
       stageError={state.stageError}
       prUrl={state.prMetadata?.url}
@@ -47,6 +48,9 @@ export const ReviewAllFilesDiffPanel: React.FC<IDockviewPanelProps> = () => {
       activeSearchMatch={state.allFilesActiveSearchMatch}
       onCodeNavRequest={state.onCodeNavRequest}
       onVisibleFileChange={state.onAllFilesVisibleFileChange}
+      fileOrder={state.allFilesOrder}
+      registerCollapseAllToggle={state.registerAllFilesCollapseToggle}
+      onAllCollapsedChange={state.onAllFilesCollapsedChange}
       isActive={state.isAllFilesActive}
       aiAvailable={state.aiAvailable}
       onAskAIForFile={state.onAskAIForFile}

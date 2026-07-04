@@ -431,7 +431,7 @@ html:not(.transitions-ready) * {
   gap: 0.5rem;
   padding: 0.25rem 0.5rem;
   border-radius: var(--radius-sm);
-  font-size: 0.75rem;
+  font-size: 0.8125rem; /* 13px — file rows felt small vs. the rest of the app */
   cursor: pointer;
   color: var(--muted-foreground);
 }
@@ -452,6 +452,13 @@ html:not(.transitions-ready) * {
 .file-tree-item.active {
   background: oklch(from var(--primary) l c h / 0.3);
   color: var(--primary);
+}
+
+/* The stage (+) button's default border (--border) has no contrast against
+   the active row's primary tint and visually disappears — tint it with the
+   row color instead. :not(:hover) leaves the button's own hover border. */
+.file-tree-item.active .stage-plus:not(:hover) {
+  border-color: oklch(from var(--primary) l c h / 0.5);
 }
 
 .file-tree-item.has-annotations {

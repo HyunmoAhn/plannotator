@@ -15,12 +15,10 @@ import { RepoIcon } from '@plannotator/ui/components/RepoIcon';
 import { PullRequestIcon } from '@plannotator/ui/components/PullRequestIcon';
 import { getPlatformLabel, getMRLabel, getMRNumberLabel, getDisplayRepo } from '@plannotator/shared/pr-types';
 import type { SemanticDiffAdvert } from '@plannotator/shared/semantic-diff-types';
-import { configStore, useConfigValue } from '@plannotator/ui/config';
+import { configStore, useConfigValue, setReviewPanelView } from '@plannotator/ui/config';
 import { loadDiffFont } from '@plannotator/ui/utils/diffFonts';
 import { getAgentSwitchSettings, getEffectiveAgentName } from '@plannotator/ui/utils/agentSwitch';
 import { useAIProviderConfig } from '@plannotator/ui/hooks/useAIProviderConfig';
-import { DiffTypeSetupDialog } from '@plannotator/ui/components/DiffTypeSetupDialog';
-import { needsDiffTypeSetup } from '@plannotator/ui/utils/diffTypeSetup';
 import { LookAndFeelAnnouncementDialog } from '@plannotator/ui/components/LookAndFeelAnnouncementDialog';
 import {
   markLookAndFeelAnnouncementSeen,
@@ -82,7 +80,10 @@ import {
 } from './dock/reviewPanelTypes';
 import type { DiffFile, AnnotationScrollTarget } from './types';
 import { annotationMatchesPrScope, proseAnnotationMatchesPr } from './utils/annotationScope';
-import type { DiffOption, WorktreeInfo, GitContext } from '@plannotator/shared/types';
+import type { DiffOption, WorktreeInfo, GitContext, SinceBaseSections } from '@plannotator/shared/types';
+import { SectionsPanel } from './components/SectionsPanel';
+import { ReviewSetupDialog } from './components/ReviewSetupDialog';
+import { needsReviewSetup, markReviewSetupSeen } from './utils/reviewSetup';
 import type { PRMetadata } from '@plannotator/shared/pr-types';
 import type { PRDiffScope, PRDiffScopeOption, PRStackInfo, PRStackTree } from '@plannotator/shared/pr-stack';
 import { altKey } from '@plannotator/ui/utils/platform';
@@ -112,6 +113,34 @@ function getFileTabTitle(filePath: string): string {
   return filePath.split('/').pop() ?? filePath;
 }
 
+// When the since-base sections sidecar is present, order the master file list
+// the way the sections panel presents it (committed → staged changes →
+// unstaged changes → untracked, stable within groups). Every consumer — the
+// sections panel, the all-files view, file navigation — then shares one
+// top-down order instead of raw patch order.
+//
+// INVARIANT: this reads the sidecar's SNAPSHOT `staged` flag, which is only
+// valid at sidecar-fresh moments — every current call site (initial load,
+// diff switch, PR response) also resets the session staging overrides, so
+// snapshot ≡ effective when the order is computed. Do NOT call this
+// mid-session to re-sort on stage/unstage: live staged display belongs to
+// useGitAdd's effective stagedFiles set (see AGENTS.md), and the file order
+// deliberately stays stable until the next refresh.
+function orderFilesBySections(files: DiffFile[], sections?: SinceBaseSections | null): DiffFile[] {
+  if (!sections) return files;
+  const rank = (file: DiffFile): number => {
+    const entry = sections.files[file.path];
+    const group = entry?.group ?? 'committed';
+    if (group === 'committed') return 0;
+    if (group === 'changes') return entry?.staged ? 1 : 2;
+    return 3;
+  };
+  return files
+    .map((file, index) => ({ file, index }))
+    .sort((a, b) => rank(a.file) - rank(b.file) || a.index - b.index)
+    .map((entry) => entry.file);
+}
+
 const ReviewApp: React.FC = () => {
   const { resolvedMode } = useTheme();
   const [diffData, setDiffData] = useState<DiffData | null>(null);
@@ -134,6 +163,16 @@ const ReviewApp: React.FC = () => {
   // moves the viewport.
   const [scrollTargetAnnotation, setScrollTargetAnnotation] = useState<AnnotationScrollTarget | null>(null);
   const [isAllFilesActive, setIsAllFilesActive] = useState(false);
+  // All-files collapse-all: the view registers its toggle here; the dock tab
+  // strip's button (ReviewDockRightActions) invokes it and reflects the flag.
+  const allFilesCollapseToggleRef = useRef<(() => void) | null>(null);
+  const [allFilesAllCollapsed, setAllFilesAllCollapsed] = useState(false);
+  const registerAllFilesCollapseToggle = useCallback((toggle: (() => void) | null) => {
+    allFilesCollapseToggleRef.current = toggle;
+  }, []);
+  const onToggleAllFilesCollapsed = useCallback(() => {
+    allFilesCollapseToggleRef.current?.();
+  }, []);
   // Mirror ref: handlers captured by Pierre slot portals (which only republish
   // on item version bumps) and early-declared callbacks read the CURRENT value
   // at call time instead of a stale closure capture.
@@ -205,6 +244,30 @@ const ReviewApp: React.FC = () => {
   //                   produced "trailing context mismatch" warnings).
   const [selectedBase, setSelectedBase] = useState<string | null>(null);
   const [committedBase, setCommittedBase] = useState<string | null>(null);
+  // Since-base sections sidecar (committed / changes / untracked grouping).
+  const [sections, setSections] = useState<SinceBaseSections | null>(null);
+  // The local origin/<default> tracking ref is behind the actual remote —
+  // the "Baseline is behind GitHub · Fetch" banner.
+  const [baseBehindRemote, setBaseBehindRemote] = useState(false);
+  // Server snapshot id (draftKey) for the diff this client is RENDERING.
+  // Echoed on every freshness probe so the server can answer per-client:
+  // "your snapshot moved" is independent of whether the VCS changed.
+  const [snapshotId, setSnapshotId] = useState<string | undefined>(undefined);
+  const [isFetchingBase, setIsFetchingBase] = useState(false);
+  // Sections vs classic tree in the left panel — backed by the configStore
+  // (also the Settings + first-run-dialog default). The header toggle writes
+  // it too, so the last choice becomes the default. Writes go through the
+  // shared coupled setter (sections ⟺ since-base — see config/reviewView).
+  const panelView = useConfigValue('reviewPanelView');
+  const selectPanelView = useCallback((view: 'sections' | 'tree') => {
+    setReviewPanelView(view);
+  }, []);
+  // First-run review-setup chooser (panel view + tree default diff).
+  const [showReviewSetup, setShowReviewSetup] = useState(false);
+  // True only for the first-run showing (where dismissing applies the recommended
+  // default). A reopen from the header menu must NOT snap the user's mid-session
+  // diff back to the default.
+  const reviewSetupIsFirstRun = useRef(false);
   const [agentCwd, setAgentCwd] = useState<string | null>(null);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -470,8 +533,6 @@ const ReviewApp: React.FC = () => {
     available: aiAvailable,
     origin,
   });
-  const [showDiffTypeSetup, setShowDiffTypeSetup] = useState(false);
-  const [diffTypeSetupPending, setDiffTypeSetupPending] = useState(false);
   // The 0.20.0 release / look-and-feel announcement also runs in code review.
   // Seen-state is a shared cookie (host-scoped), so dismissing it in either app
   // suppresses it in the other — it appears once across both.
@@ -921,13 +982,17 @@ const ReviewApp: React.FC = () => {
         error?: string;
         isWSL?: boolean;
         semanticDiff?: SemanticDiffAdvert;
+        sections?: SinceBaseSections;
+        baseBehindRemote?: boolean;
+        snapshotId?: string;
         serverConfig?: { displayName?: string; gitUser?: string };
       }) => {
         // Initialize config store with server-provided values (config file > cookie > default)
         configStore.init(data.serverConfig);
         // gitUser drives the "Use git name" button in Settings; stays undefined (button hidden) when unavailable
         setGitUser(data.serverConfig?.gitUser);
-        const apiFiles = parseDiffToFiles(data.rawPatch);
+        setSnapshotId(data.snapshotId);
+        const apiFiles = orderFilesBySections(parseDiffToFiles(data.rawPatch), data.sections);
         setDiffData({
           files: apiFiles,
           rawPatch: data.rawPatch,
@@ -975,9 +1040,30 @@ const ReviewApp: React.FC = () => {
         if (data.error) setDiffError(data.error);
         if (data.isWSL) setIsWSL(true);
         setSemanticDiffAvailable(data.semanticDiff?.available === true);
-        // Mark diff type setup as pending on first run (local mode only)
-        if (data.diffType && data.mode !== 'workspace' && !data.prMetadata && data.gitContext && data.gitContext.vcsType !== 'p4' && data.gitContext.vcsType !== 'jj' && needsDiffTypeSetup()) {
-          setDiffTypeSetupPending(true);
+        setSections(data.sections ?? null);
+        setBaseBehindRemote(data.baseBehindRemote === true);
+        // First-run: offer the review-view chooser for a plain local git
+        // session (not workspace/PR/jj/p4), once. On this first showing we
+        // RESET to the recommended default (Git status + All changes), overriding
+        // any prior diff-type/panel preference — the user's explicit choice in
+        // the dialog then sticks. Applied to the live session on dismiss.
+        //
+        // Only when since-base is actually AVAILABLE (base ref resolves). On a
+        // repo where getGitContext omits it (trunk / no origin/HEAD), forcing
+        // since-base would degrade to HEAD and hide committed work — the exact
+        // case the offering guard avoids. There, leave the default alone and
+        // don't show the chooser. Matches the sectionsCapable gate used for the
+        // header-menu reopen.
+        const sinceBaseAvailable = !!data.gitContext?.diffOptions?.some(
+          (o: { id: string }) => o.id === 'since-base',
+        );
+        if (
+          data.gitContext && data.mode !== 'workspace' && !data.prMetadata &&
+          data.gitContext.vcsType === 'git' && sinceBaseAvailable && needsReviewSetup()
+        ) {
+          setReviewPanelView('sections'); // coupled setter — also sets since-base
+          reviewSetupIsFirstRun.current = true;
+          setShowReviewSetup(true);
         }
       })
       .catch(() => {
@@ -994,14 +1080,6 @@ const ReviewApp: React.FC = () => {
       })
       .finally(() => setIsLoading(false));
   }, []);
-
-  // Show diff type setup after the initial diff payload marks it pending.
-  useEffect(() => {
-    if (diffTypeSetupPending) {
-      setDiffTypeSetupPending(false);
-      setShowDiffTypeSetup(true);
-    }
-  }, [diffTypeSetupPending]);
 
   // Handle line selection from diff viewer
   const handleLineSelection = useCallback((range: SelectedLineRange | null) => {
@@ -1203,7 +1281,7 @@ const ReviewApp: React.FC = () => {
       const lastColon = rest.lastIndexOf(':');
       if (lastColon !== -1) {
         const sub = rest.slice(lastColon + 1);
-        if (['uncommitted', 'staged', 'unstaged', 'last-commit', 'branch', 'merge-base', 'all'].includes(sub)) {
+        if (['since-base', 'uncommitted', 'staged', 'unstaged', 'last-commit', 'branch', 'merge-base', 'all'].includes(sub)) {
           return { activeWorktreePath: rest.slice(0, lastColon), activeDiffBase: sub };
         }
       }
@@ -1212,18 +1290,66 @@ const ReviewApp: React.FC = () => {
     return { activeWorktreePath: null, activeDiffBase: diffType };
   }, [diffType]);
 
+  // The three-stack sections panel exists only for the since-base composite
+  // view in a plain git session (PR/workspace keep the classic tree).
+  const sectionsAvailable = !!sections && activeDiffBase === 'since-base' && !prMetadata && reviewMode !== 'workspace';
+  // The sections view IS the since-base comparison — a repo that supports it
+  // shows the view toggle even while an advanced (tree) mode is active, and
+  // toggling back to Sections switches the diff back to since-base.
+  const sectionsCapable = !prMetadata && reviewMode !== 'workspace'
+    && !!gitContext?.diffOptions?.some(option => option.id === 'since-base');
+  // The all-files surface mirrors whichever left panel is showing: sections
+  // order when the sections view is active, tree order otherwise.
+  const allFilesOrder: 'tree' | 'list' = sectionsAvailable && panelView === 'sections' ? 'list' : 'tree';
+
   // Git add/staging logic
   const handleFileViewedFromStage = useCallback(
     (path: string) => setViewedFiles(prev => new Set(prev).add(path)),
     [],
   );
+  // Files already staged when the sidecar snapshot was taken — the hook folds
+  // these into the effective staged set so pre-staged files toggle correctly.
+  // Filtered to RENDERED paths: porcelain marks BOTH sides of a staged rename
+  // staged, but an above-threshold rename renders as one file (the new path)
+  // — counting the hidden old path inflates "N added" and leaves a phantom
+  // entry the user can never unstage. Below-threshold renames render
+  // delete+add as two rows and both sides correctly pass this filter.
+  const sidecarStaged = useMemo(() => {
+    const staged = new Set<string>();
+    if (sections) {
+      const rendered = new Set(files.map((file) => file.path));
+      for (const [path, entry] of Object.entries(sections.files)) {
+        if (entry.staged && rendered.has(path)) staged.add(path);
+      }
+    }
+    return staged;
+  }, [sections, files]);
   const { stagedFiles, stagingFile, canStageFiles: canStageRaw, stageFile, resetStagedFiles, stageError } = useGitAdd({
     activeDiffBase,
     onFileViewed: handleFileViewedFromStage,
+    sidecarStaged,
   });
   // Staging is never available in PR review mode — the server rejects it and the UI shouldn't offer it.
   const canStageInWorkspace = reviewMode !== 'workspace' || workspaceDiffOptions?.some((option) => option.id === 'workspace-staged');
   const canStageFiles = canStageRaw && !prMetadata && canStageInWorkspace;
+  // Per-file staging gate. In since-base mode only working-tree files
+  // (changes/untracked) are stageable; committed files — or files with no
+  // sidecar entry — are not: `git add` on them is a confusing no-op that would
+  // still flip the local staged/viewed state. Other stageable modes have no
+  // committed section, so the mode-level flag suffices there. Used everywhere
+  // staging is triggered without going through a per-row button (the `a`
+  // shortcut on the focused file, and the All-files surface).
+  const isPathStageable = useCallback((path: string | null | undefined): boolean => {
+    if (!canStageFiles || !path) return false;
+    if (activeDiffBase === 'since-base') {
+      // Sidecar not loaded yet → can't tell committed from working-tree, so
+      // don't offer staging (the panel is in its marker-less tree fallback
+      // anyway). Prevents a git-add no-op on a clean committed file.
+      if (!sections) return false;
+      return (sections.files[path]?.group ?? 'committed') !== 'committed';
+    }
+    return true;
+  }, [canStageFiles, activeDiffBase, sections]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -1235,25 +1361,27 @@ const ReviewApp: React.FC = () => {
       if (e.key === 'v') {
         e.preventDefault();
         handleToggleViewed(filePath);
-      } else if (e.key === 'a' && canStageFiles) {
+      } else if (e.key === 'a' && isPathStageable(filePath)) {
         e.preventDefault();
         stageFile(filePath);
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [files, activeFileIndex, isDiffPanelActive, handleToggleViewed, canStageFiles, stageFile]);
+  }, [files, activeFileIndex, isDiffPanelActive, handleToggleViewed, isPathStageable, stageFile]);
 
   // Shared function: apply a PR response (used by both initial load and PR switch)
   function applyPRResponse(data: PRSessionUpdate & {
     rawPatch: string; gitRef: string;
     aiReviewContext?: string;
+    snapshotId?: string;
     repoInfo?: { display: string; branch?: string };
     viewedFiles?: string[]; error?: string;
     semanticDiff?: SemanticDiffAdvert;
     agentCwd?: string | null;
   }) {
     const isPRSwitch = !!data.prMetadata;
+    setSnapshotId(data.snapshotId);
     const nextFiles = parseDiffToFiles(data.rawPatch);
     dockApi?.getPanel(REVIEW_DIFF_PANEL_ID)?.api.close();
     needsInitialDiffPanel.current = true;
@@ -1304,7 +1432,7 @@ const ReviewApp: React.FC = () => {
   // Shared helper: fetch a diff switch and update state.
   // Returns true on success, false on failure — callers that optimistically
   // updated UI state (e.g. the base picker) can use this to revert.
-  const fetchDiffSwitch = useCallback(async (fullDiffType: string, baseOverride?: string, options?: { preserveFile?: boolean }): Promise<boolean> => {
+  const fetchDiffSwitch = useCallback(async (fullDiffType: string, baseOverride?: string, options?: { preserveFile?: boolean; explicitBase?: boolean }): Promise<boolean> => {
     setIsLoadingDiff(true);
     try {
       const res = await fetch('/api/diff/switch', {
@@ -1316,6 +1444,11 @@ const ReviewApp: React.FC = () => {
           // so forwarding unconditionally is safe and keeps the request shape uniform.
           ...((baseOverride ?? selectedBase) && { base: baseOverride ?? selectedBase }),
           hideWhitespace: diffHideWhitespace,
+          // True only when the base came from the picker THIS request — the
+          // server then honors it verbatim (no origin/* canonicalization).
+          // Echoed bases (diff-type switches, refreshes) stay canonicalizable
+          // so an early-loaded client can't revert the startup base upgrade.
+          ...(options?.explicitBase && { explicitBase: true }),
         }),
       });
 
@@ -1325,16 +1458,27 @@ const ReviewApp: React.FC = () => {
         rawPatch: string;
         gitRef: string;
         aiReviewContext?: string;
+        snapshotId?: string;
         diffType: string;
         base?: string;
         gitContext?: GitContext;
         diffOptions?: DiffOption[];
         error?: string;
         semanticDiff?: SemanticDiffAdvert;
+        sections?: SinceBaseSections;
+        baseBehindRemote?: boolean;
+        superseded?: boolean;
       };
 
-      const nextFiles = parseDiffToFiles(data.rawPatch);
+      // A newer switch superseded this one server-side — ignore this stale
+      // body so it can't overwrite the newer result (last-response-wins).
+      if (data.superseded) return true;
+      setSnapshotId(data.snapshotId);
+
+      const nextFiles = orderFilesBySections(parseDiffToFiles(data.rawPatch), data.sections);
       applySemanticDiffAdvert(data.semanticDiff);
+      setSections(data.sections ?? null);
+      setBaseBehindRemote(data.baseBehindRemote === true);
 
       if (options?.preserveFile) {
         // Whitespace toggle: update patch in-place, keep the active file.
@@ -1342,6 +1486,15 @@ const ReviewApp: React.FC = () => {
         // dock panel to the first remaining file.
         setDiffData(prev => prev ? { ...prev, rawPatch: data.rawPatch, gitRef: data.gitRef, aiReviewContext: data.aiReviewContext } : prev);
         if (data.diffOptions) setWorkspaceDiffOptions(data.diffOptions);
+        // Adopt the server's base even on in-place refreshes: the staleness
+        // Refresh and post-Fetch paths both preserveFile, and they're exactly
+        // when the server may canonicalize the base (main -> origin/main after
+        // the startup upgrade). Keeping the old name would send /api/file-content
+        // and Ask AI context requests against the wrong base.
+        if (data.base) {
+          setSelectedBase(data.base);
+          setCommittedBase(data.base);
+        }
         setFiles(nextFiles);
         const currentPath = files[activeFileIndex]?.path;
         const nextIdx = currentPath ? nextFiles.findIndex(f => f.path === currentPath) : -1;
@@ -1355,6 +1508,9 @@ const ReviewApp: React.FC = () => {
         // selection anchored to the old patch is stale — clear it (the
         // non-preserve branch below already does).
         setPendingSelection(null);
+        // The refetched sidecar already reflects this session's staging;
+        // stale overrides would fight the fresh snapshot.
+        resetStagedFiles();
       } else {
         dockApi?.getPanel(REVIEW_DIFF_PANEL_ID)?.api.close();
         needsInitialDiffPanel.current = true;
@@ -1417,8 +1573,8 @@ const ReviewApp: React.FC = () => {
       if (branch === selectedBase) return;
       const previous = selectedBase;
       setSelectedBase(branch);
-      if (activeDiffBase === 'branch' || activeDiffBase === 'merge-base' || activeDiffBase === 'jj-line' || activeDiffBase === 'jj-evolog') {
-        const ok = await fetchDiffSwitch(diffType, branch);
+      if (activeDiffBase === 'since-base' || activeDiffBase === 'branch' || activeDiffBase === 'merge-base' || activeDiffBase === 'jj-line' || activeDiffBase === 'jj-evolog') {
+        const ok = await fetchDiffSwitch(diffType, branch, { explicitBase: true });
         if (!ok) setSelectedBase(previous);
       }
     },
@@ -1447,6 +1603,39 @@ const ReviewApp: React.FC = () => {
     if (baseOverride) setSelectedBase(baseOverride);
     await fetchDiffSwitch(fullDiffType, baseOverride);
   }, [diffType, activeWorktreePath, fetchDiffSwitch, gitContext]);
+
+  // Toggling to Sections means "show me the since-base review" — if an
+  // advanced mode is active, switch the diff back along with the view.
+  // selectPanelView goes through the coupled setter, which also persists
+  // defaultDiffType=since-base; this handler only brings the live session
+  // diff along.
+  const handleSwitchToSections = useCallback(() => {
+    selectPanelView('sections');
+    if (activeDiffBase !== 'since-base') void handleDiffSwitch('since-base');
+  }, [selectPanelView, activeDiffBase, handleDiffSwitch]);
+
+  // Self-heal a conflicted persisted pair: reviewPanelView=sections with a
+  // non-since-base defaultDiffType. Every UI writer enforces the coupling
+  // (sections ⟺ since-base), but configStore.init() applies config.json over
+  // the cookie WITHOUT it — so a stale server value (a debounced write lost
+  // when a session closed, or a pre-feature config file) re-corrupts the pair
+  // on every load: the server opens on the stale diff in the classic tree
+  // while the cookie still says Git status. Trust the view choice, repair the
+  // diff default (cookie + config.json), and bring the live session along.
+  const healedPanelPairOnLoad = useRef(false);
+  useEffect(() => {
+    if (healedPanelPairOnLoad.current || isLoading || !diffData) return;
+    // First-run resets + applies the pair itself (on dialog dismiss).
+    if (!sectionsCapable || reviewSetupIsFirstRun.current) return;
+    if (panelView !== 'sections') return;
+    healedPanelPairOnLoad.current = true;
+    if (configStore.get('defaultDiffType') !== 'since-base') {
+      // Re-assert the pair through the coupled setter (repairs cookie +
+      // config.json), then bring the live session along.
+      setReviewPanelView('sections');
+      if (activeDiffBase !== 'since-base') void handleDiffSwitch('since-base');
+    }
+  }, [isLoading, diffData, sectionsCapable, panelView, activeDiffBase, handleDiffSwitch]);
 
   // Switch worktree context (or back to main repo). Preserves the current
   // diff mode across the switch — if the reviewer was looking at "PR Diff"
@@ -1481,20 +1670,67 @@ const ReviewApp: React.FC = () => {
   const diffFreshness = useDiffFreshness({
     enabled: !!origin,
     resetKey: diffData?.rawPatch ?? '',
+    snapshotId,
     onAgentCwd: setAgentCwd,
+    onBaseBehindRemote: setBaseBehindRemote,
   });
+
+  // "Baseline is behind GitHub · Fetch" — fetch the remote default branch,
+  // then recompute the current diff in place (preserving the active file).
+  // Live diff selection for async completions that must detect "the user
+  // moved on" (see handleFetchBase). Updated every render.
+  const liveSelectionRef = useRef({ diffType, selectedBase });
+  liveSelectionRef.current = { diffType, selectedBase };
+
+  const handleFetchBase = useCallback(async () => {
+    // Captured at click time; compared against the live ref when the fetch
+    // completes. The replay exists to refresh the SAME view with the fetched
+    // baseline — if the user switched diff type or base while the (possibly
+    // slow) fetch ran, replaying the captured values would win the switch
+    // epoch and silently yank them back to the old view.
+    const captured = { diffType, selectedBase };
+    setIsFetchingBase(true);
+    try {
+      const res = await fetch('/api/fetch-base', { method: 'POST' });
+      if (!res.ok) return;
+      const data = await res.json() as { ok?: boolean; baseBehindRemote?: boolean };
+      setBaseBehindRemote(data.baseBehindRemote === true);
+      const now = liveSelectionRef.current;
+      if (now.diffType === captured.diffType && now.selectedBase === captured.selectedBase) {
+        await fetchDiffSwitch(captured.diffType, captured.selectedBase ?? undefined, { preserveFile: true });
+      }
+    } catch {
+      // Best-effort: the banner stays and the user can retry.
+    } finally {
+      setIsFetchingBase(false);
+    }
+  }, [diffType, selectedBase, fetchDiffSwitch]);
 
   const handleRefreshStaleDiff = useCallback(() => {
     if (prMetadata) {
-      // Only the full-stack scope can go stale locally — the layer diff is
-      // computed platform-side and its fingerprint never flips.
-      if (prDiffScope === 'full-stack') handlePRDiffScopeSelect('full-stack');
+      // Either scope can be stale now: full-stack via its local VCS
+      // fingerprint, and ANY scope via a snapshot mismatch (another tab
+      // switched scope or PR). Re-selecting the CURRENT scope re-fetches the
+      // server's snapshot for this tab (the endpoint has no same-scope
+      // early-return). Known residual: after a cross-tab PR SWITCH this
+      // updates the patch but not prMetadata (the scope endpoint doesn't
+      // carry it) — accepted for the rare two-tab case.
+      //
+      // Incomplete layer patch: the server's layer branch runs the local
+      // recompute, which can park for MINUTES behind checkout warmup — use
+      // the non-blocking upgrade path (progress notice) instead of
+      // handlePRDiffScopeSelect's full-screen switch overlay.
+      if (prDiffScope === 'layer' && prPatchIncomplete) {
+        void handleLoadFullDiff();
+      } else {
+        void handlePRDiffScopeSelect(prDiffScope);
+      }
       return;
     }
     // Same params, fresh snapshot. preserveFile keeps the reviewer on the
     // file they were reading.
     void fetchDiffSwitch(diffType, selectedBase, { preserveFile: true });
-  }, [prMetadata, prDiffScope, handlePRDiffScopeSelect, fetchDiffSwitch, diffType, selectedBase]);
+  }, [prMetadata, prDiffScope, prPatchIncomplete, handlePRDiffScopeSelect, handleLoadFullDiff, fetchDiffSwitch, diffType, selectedBase]);
 
   // Select annotation - switches file if needed and scrolls to it.
   // isAllFilesActive is read through the ref (declared with the state): this
@@ -1667,7 +1903,7 @@ const ReviewApp: React.FC = () => {
     // the new patch to arrive before refetching — otherwise the viewer can
     // briefly pair an old patch with the new base's content.
     reviewBase:
-        (activeDiffBase === 'branch' || activeDiffBase === 'merge-base' || activeDiffBase === 'jj-line' || activeDiffBase === 'jj-evolog')
+        (activeDiffBase === 'since-base' || activeDiffBase === 'branch' || activeDiffBase === 'merge-base' || activeDiffBase === 'jj-line' || activeDiffBase === 'jj-evolog')
         ? committedBase ?? undefined
         : undefined,
     activeDiffBase,
@@ -1708,6 +1944,7 @@ const ReviewApp: React.FC = () => {
     stagingFile,
     onStage: stageFile,
     canStageFiles,
+    canStagePath: isPathStageable,
     stageError,
     searchQuery: isSearchPending ? '' : debouncedSearchQuery,
     isSearchPending,
@@ -1736,6 +1973,11 @@ const ReviewApp: React.FC = () => {
     openDiffFile,
     onAllFilesVisibleFileChange: setAllFilesVisibleFile,
     isAllFilesActive,
+    allFilesOrder,
+    allFilesAllCollapsed,
+    onToggleAllFilesCollapsed,
+    registerAllFilesCollapseToggle,
+    onAllFilesCollapsedChange: setAllFilesAllCollapsed,
     isSemanticDiffActive,
     semanticDiffAvailable,
     onSemanticDiffUnavailable: handleSemanticDiffUnavailable,
@@ -1759,13 +2001,13 @@ const ReviewApp: React.FC = () => {
     handleAddAnnotation, handleAddFileComment, handleAddFileCommentForFile, handleEditAnnotation,
     handleSelectAnnotation, handleNavigateToAnnotation, handleDeleteAnnotation, viewedFiles,
     handleToggleViewed, stagedFiles, stagingFile, stageFile,
-    canStageFiles, stageError, isSearchPending, debouncedSearchQuery,
+    canStageFiles, isPathStageable, stageError, isSearchPending, debouncedSearchQuery,
     activeFileSearchMatches, activeSearchMatchId, activeSearchMatch, searchMatches,
     aiAvailable, aiMessages, aiIsCreatingSession, aiIsStreaming,
     handleAskAI, handleAskAIForFile, handleViewAIResponse, handleClickAIMarker,
     aiHistoryForSelection, getAIHistoryForFile, agentJobs.jobs, prMetadata, prContext,
     isPRContextLoading, prContextError, fetchPRContext, platformUser, openDiffFile,
-    handleOpenTour, isAllFilesActive, isSemanticDiffActive, semanticDiffAvailable,
+    handleOpenTour, isAllFilesActive, allFilesOrder, allFilesAllCollapsed, onToggleAllFilesCollapsed, registerAllFilesCollapseToggle, isSemanticDiffActive, semanticDiffAvailable,
     handleSemanticDiffUnavailable, handleSemanticDiffLoadError, handleSemanticDiffLoadSuccess, handleAddAnnotationForFile,
     handleCodeNavRequest, codeNav.result, codeNav.isLoading, codeNav.activeSymbol,
   ]);
@@ -2350,6 +2592,31 @@ const ReviewApp: React.FC = () => {
                   </div>
                 )}
 
+                {/* Baseline staleness — origin/<default> is behind the actual
+                    remote, so the "since main" comparison is against stale
+                    GitHub state. Fetch catches the tracking ref up and
+                    recomputes the diff in place. */}
+                {baseBehindRemote && !prMetadata && !isLoadingDiff && (
+                  <div className="flex items-center gap-2 text-xs text-amber-700 dark:text-amber-300 px-2 py-1 bg-amber-500/10 rounded border border-amber-500/25">
+                    <span className="hidden md:inline">Baseline is behind GitHub</span>
+                    <span className="md:hidden">Base behind</span>
+                    {isFetchingBase ? (
+                      <span className="flex items-center gap-1.5 font-medium">
+                        <span className="inline-block w-3 h-3 border-[1.5px] border-current border-t-transparent rounded-full animate-spin" aria-hidden />
+                        Fetching…
+                      </span>
+                    ) : (
+                      <button
+                        onClick={handleFetchBase}
+                        className="font-medium underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-100 transition-colors"
+                        title="git fetch the default branch and recompute the diff"
+                      >
+                        Fetch
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 {/* Agent mode: Close/SendFeedback flip + Approve */}
                 {!platformMode ? (
                   <AgentReviewActions
@@ -2496,6 +2763,7 @@ const ReviewApp: React.FC = () => {
 
             <ReviewHeaderMenu
               onOpenSettings={() => setOpenSettingsMenu(true)}
+              onOpenReviewSetup={sectionsCapable ? () => { reviewSetupIsFirstRun.current = false; setShowReviewSetup(true); } : undefined}
               onOpenExport={() => setShowExportModal(true)}
               onCopyAgentInstructions={handleCopyAgentInstructions}
               onToggleFileTree={() => setIsFileTreeOpen(prev => !prev)}
@@ -2513,7 +2781,60 @@ const ReviewApp: React.FC = () => {
 
         {/* Main content */}
         <div className={`flex-1 flex overflow-hidden ${isResizing ? 'select-none' : ''}`}>
-          {shouldShowFileTree && isFileTreeOpen && (
+          {shouldShowFileTree && isFileTreeOpen && sectionsAvailable && panelView === 'sections' && (
+            <div className="contents group/sidebar">
+              <SectionsPanel
+                files={files}
+                sections={sections!}
+                width={fileTreeResize.width}
+                activeFileIndex={isAllFilesActive || isSemanticDiffActive || isPROverviewActive ? -1 : activeFileIndex}
+                scrollHighlightIndex={isAllFilesActive && allFilesVisibleFile ? files.findIndex(f => f.path === allFilesVisibleFile) : undefined}
+                onSelectFile={handleFilePreview}
+                onDoubleClickFile={handleFilePinned}
+                enableKeyboardNav={!showExportModal && hasSearchableFiles}
+                annotations={allAnnotations}
+                viewedFiles={viewedFiles}
+                onToggleViewed={handleToggleViewed}
+                hideViewedFiles={hideViewedFiles}
+                onToggleHideViewed={() => setHideViewedFiles(prev => !prev)}
+                stagedFiles={stagedFiles}
+                stagingFile={stagingFile}
+                canStage={canStageFiles}
+                onStageFile={stageFile}
+                isLoadingDiff={isLoadingDiff}
+                availableBranches={gitContext?.availableBranches}
+                selectedBase={selectedBase ?? undefined}
+                detectedBase={gitContext?.defaultBranch || gitContext?.compareTarget?.fallback}
+                onSelectBase={handleBaseSelect}
+                compareTarget={gitContext?.compareTarget}
+                recentCommits={gitContext?.recentCommits}
+                onSelectPanelView={selectPanelView}
+                onSelectAllFiles={openAllFilesPanel}
+                isAllFilesActive={isAllFilesActive}
+                onSelectSemanticDiff={() => openSemanticDiffPanel()}
+                isSemanticDiffActive={isSemanticDiffActive}
+                semanticDiffAvailable={semanticDiffAvailable}
+                onCopyRawDiff={handleCopyDiff}
+                canCopyRawDiff={!!diffData?.rawPatch}
+                copyRawDiffStatus={copyRawDiffStatus}
+                searchQuery={hasSearchableFiles ? searchQuery : ''}
+                isSearchOpen={hasSearchableFiles ? isSearchOpen : false}
+                isSearchPending={isSearchPending}
+                searchInputRef={hasSearchableFiles ? searchInputRef : undefined}
+                onOpenSearch={hasSearchableFiles ? openSearch : undefined}
+                onSearchChange={hasSearchableFiles ? handleSearchInputChange : undefined}
+                onSearchClear={hasSearchableFiles ? clearSearch : undefined}
+                onSearchClose={hasSearchableFiles ? closeSearch : undefined}
+                searchGroups={hasSearchableFiles ? searchGroups : []}
+                searchMatches={hasSearchableFiles ? searchMatches : []}
+                activeSearchMatchId={hasSearchableFiles ? activeSearchMatchId : null}
+                onSelectSearchMatch={hasSearchableFiles ? handleSelectSearchMatch : undefined}
+                onStepSearchMatch={hasSearchableFiles ? stepSearchMatch : undefined}
+              />
+              <ResizeHandle {...fileTreeResize.handleProps} className="z-10" side="left" onCollapse={() => setIsFileTreeOpen(false)} />
+            </div>
+          )}
+          {shouldShowFileTree && isFileTreeOpen && !(sectionsAvailable && panelView === 'sections') && (
             <div className="contents group/sidebar">
               <FileTree
                 files={files}
@@ -2571,6 +2892,10 @@ const ReviewApp: React.FC = () => {
                 onSelectSearchMatch={hasSearchableFiles ? handleSelectSearchMatch : undefined}
                 onStepSearchMatch={hasSearchableFiles ? stepSearchMatch : undefined}
                 repoRoot={prMetadata ? null : (activeWorktreePath ?? agentCwd ?? gitContext?.cwd ?? null)}
+                onSwitchToSections={sectionsCapable ? handleSwitchToSections : undefined}
+                sinceBaseSections={activeDiffBase === 'since-base' ? sections : null}
+                onStageFile={canStageFiles ? stageFile : undefined}
+                stagingFile={stagingFile}
               />
               <ResizeHandle {...fileTreeResize.handleProps} className="z-10" side="left" onCollapse={() => setIsFileTreeOpen(false)} />
             </div>
@@ -2626,6 +2951,7 @@ const ReviewApp: React.FC = () => {
                       <>
                         <h3 className="text-sm font-medium text-foreground">No changes</h3>
                         <p className="text-xs text-muted-foreground mt-1">
+                          {activeDiffBase === 'since-base' && `No changes since ${selectedBase || gitContext?.defaultBranch || 'main'}${activeWorktreePath ? ' in this worktree' : ''} — committed, uncommitted, or untracked.`}
                           {activeDiffBase === 'uncommitted' && `No uncommitted changes${activeWorktreePath ? ' in this worktree' : ' to review'}.`}
                           {activeDiffBase === 'staged' && "No staged changes. Stage some files with git add."}
                           {activeDiffBase === 'unstaged' && "No unstaged changes. All changes are staged."}
@@ -2758,6 +3084,14 @@ const ReviewApp: React.FC = () => {
             gitUser={gitUser}
             externalOpen={openSettingsMenu}
             onExternalClose={() => setOpenSettingsMenu(false)}
+            // Local git session where since-base isn't offered (base ref
+            // unresolvable): the Git tab notes that the Git-status preference
+            // can't take effect in THIS repo. PR/workspace/jj sessions say
+            // nothing — the preference isn't about them.
+            sinceBaseUnavailable={
+              !!gitContext && gitContext.vcsType === 'git' && !prMetadata &&
+              reviewMode !== 'workspace' && !sectionsCapable
+            }
           />
         </div>
 
@@ -2840,12 +3174,24 @@ const ReviewApp: React.FC = () => {
           onDismiss={dismissLookAndFeel}
         />
 
-        {/* Diff type setup dialog — first-run only */}
-        {showDiffTypeSetup && !showLookAndFeel && (
-          <DiffTypeSetupDialog
-            onComplete={(selected) => {
-              setShowDiffTypeSetup(false);
-              if (selected !== diffType) handleDiffSwitch(selected);
+        {/* First-run review-view chooser (panel view + tree default diff).
+            Deferred behind the shared look-and-feel announcement so they never
+            stack. On dismiss, apply the chosen default to the current session. */}
+        {showReviewSetup && !showLookAndFeel && (
+          <ReviewSetupDialog
+            isOpen
+            onDismiss={() => {
+              markReviewSetupSeen();
+              setShowReviewSetup(false);
+              // Apply the chosen default to the live session ONLY on first run.
+              // A reopen from the header menu is a glance — it must not yank the
+              // user's mid-session diff selection back to the default.
+              if (!reviewSetupIsFirstRun.current) return;
+              reviewSetupIsFirstRun.current = false;
+              const chosen = configStore.get('defaultDiffType');
+              if (chosen && chosen !== activeDiffBase && !prMetadata && reviewMode !== 'workspace') {
+                void handleDiffSwitch(chosen);
+              }
             }}
           />
         )}
