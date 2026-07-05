@@ -143,6 +143,20 @@ export const CommittedDot: React.FC = () => (
   </span>
 );
 
+/** File path that always keeps the filename visible. The directory part
+ * absorbs all truncation (ellipsis lands right before the final slash);
+ * only a filename that alone exceeds the row truncates at its own end. */
+export const TruncatedPath: React.FC<{ path: string }> = ({ path }) => {
+  const slash = path.lastIndexOf('/');
+  if (slash === -1) return <span className="truncate">{path}</span>;
+  return (
+    <span className="flex items-center min-w-0">
+      <span className="truncate">{path.slice(0, slash)}</span>
+      <span className="flex-shrink-0 max-w-full truncate">{path.slice(slash)}</span>
+    </span>
+  );
+};
+
 /** Comment icon + annotation count, rendered directly after the file path. */
 export const AnnotationBadge: React.FC<{ count: number }> = ({ count }) => {
   if (count <= 0) return null;

@@ -4,7 +4,7 @@ import type { AvailableBranches, CompareTargetConfig, RecentCommit, SinceBaseSec
 import { BaseBranchPicker } from './BaseBranchPicker';
 import { PanelViewToggle } from './PanelViewToggle';
 import { SemanticDiffRow, AllFilesRow } from './PanelNavRows';
-import { ViewedControl, ChangeTypeLetter, StageControl, AnnotationBadge, DiffCounts, CommittedDot } from './FileRowBits';
+import { ViewedControl, ChangeTypeLetter, StageControl, AnnotationBadge, DiffCounts, CommittedDot, TruncatedPath } from './FileRowBits';
 import { SearchFileGroup } from './FileTree';
 import type { ReviewSearchFileGroup, ReviewSearchMatch } from '../utils/reviewSearch';
 import { OverlayScrollArea } from '@plannotator/ui/components/OverlayScrollArea';
@@ -149,7 +149,7 @@ const SectionRow: React.FC<{
           <span className="w-4 h-4 flex-shrink-0" aria-hidden="true" />
         ) : null}
         <ChangeTypeLetter status={file.status} oldPath={file.oldPath} untracked={item.group === 'untracked'} />
-        <span className="truncate">{file.path}</span>
+        <TruncatedPath path={file.path} />
         <AnnotationBadge count={annotationCount} />
       </div>
       <DiffCounts additions={file.additions} deletions={file.deletions} />
